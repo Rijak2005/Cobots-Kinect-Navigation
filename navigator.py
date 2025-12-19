@@ -15,29 +15,40 @@ def wrap_angle(rad: float) -> float:
 
 @dataclass
 class NavConfig:
-    command_interval_s: float = 0.25
+    command_interval_s: float = 0.5
 
-    # success distance
-    pos_tolerance_m: float = 0.05  # 5 cm for chair testing
+    # Position success threshold
+    pos_tolerance_m: float = 0.04  # 4cm (start here; tighten later)
 
-    # turn hysteresis (prevents turn-left/turn-right flipping)
-    turn_start_deg: float = 30.0
-    turn_stop_deg: float = 12.0
+    # Turn hysteresis:
+    # - start turning if error > turn_start_deg
+    # - stop turning only once error < turn_stop_deg
+    turn_start_deg: float = 25.0
+    turn_stop_deg: float = 10.0
 
-    # when close, be gentle
-    close_distance_m: float = 0.12
+    # When close to the goal, we prefer smaller corrections
+    close_distance_m: float = 0.10  # 10 cm
 
-    min_confidence: float = 0.18
+    min_confidence: float = 0.15
 
 
 class GridNavigator:
+    """
+    Prints simple commands at fixed intervals to reach each target:
+      - turn left / turn right
+      - move forward
+      - move back (rare fallback)
+    """
+
     def __init__(self, cfg: NavConfig) -> None:
         self.cfg = cfg
         self.targets_xy: List[Tuple[float, float]] = []
         self._idx: int = 0
         self._waiting_for_stilt: bool = False
         self._last_cmd_time: float = 0.0
-        self._turning_dir: Optional[str] = None
+
+        # Turning state to avoid oscillation
+        self._turning_dir: Optional[str] = None  # "left" / "right" / None
 
     @property
     def waiting_for_stilt(self) -> bool:
@@ -63,11 +74,6 @@ class GridNavigator:
     def is_done(self) -> bool:
         return self._idx >= len(self.targets_xy)
 
-    def current_target(self) -> Optional[Tuple[float, float]]:
-        if self.is_done():
-            return None
-        return self.targets_xy[self._idx]
-
     def update(self, robot: Optional[RobotPose2D], now_s: float) -> Optional[str]:
         if now_s - self._last_cmd_time < self.cfg.command_interval_s:
             return None
@@ -85,7 +91,7 @@ class GridNavigator:
 
         if robot.confidence < self.cfg.min_confidence:
             self._turning_dir = None
-            return "Robot detection weak. Hold position."
+            return "Robot detection weak. Hold position (improve marker visibility)."
 
         tx, ty = self.targets_xy[self._idx]
         dx = tx - robot.x
@@ -100,31 +106,37 @@ class GridNavigator:
         angle_to_target = float(np.arctan2(dy, dx))
         err = wrap_angle(angle_to_target - robot.heading)
 
-        start = float(np.deg2rad(self.cfg.turn_start_deg))
-        stop = float(np.deg2rad(self.cfg.turn_stop_deg))
+        turn_start = float(np.deg2rad(self.cfg.turn_start_deg))
+        turn_stop = float(np.deg2rad(self.cfg.turn_stop_deg))
 
-        # Turning hysteresis:
+        # Decide if we should be turning (hysteresis)
         if self._turning_dir is None:
-            if abs(err) > start:
+            if abs(err) > turn_start:
                 self._turning_dir = "left" if err > 0 else "right"
         else:
-            if abs(err) < stop:
+            # Keep turning until we're well aligned
+            if abs(err) < turn_stop:
                 self._turning_dir = None
             else:
-                # if we overshoot, allow switching
+                # If error changes sign strongly, switch direction
                 if err > 0 and self._turning_dir == "right":
                     self._turning_dir = "left"
                 elif err < 0 and self._turning_dir == "left":
                     self._turning_dir = "right"
 
+        # If we are turning, print turning command
         if self._turning_dir is not None:
-            return f"turn {self._turning_dir} (err {np.rad2deg(err):+.1f}°, dist {dist*100:.1f}cm)"
+            return f"turn {self._turning_dir} (angle error {np.rad2deg(err):+.1f}°, dist {dist*100:.1f} cm)"
 
-        # Aligned enough => move
+        # Otherwise, we're aligned enough -> move
+        # If very close, just move forward slowly (still a simple command text)
         if dist < self.cfg.close_distance_m:
-            return f"move forward (close {dist*100:.1f}cm)"
+            return f"move forward (close: {dist*100:.1f} cm)"
 
-        return f"move forward (dist {dist*100:.1f}cm)"
+        # Forward/back decision (rarely needed, but keeps it sane)
+        if np.cos(err) < 0.0:
+            return f"move back (dist {dist*100:.1f} cm)"
+        return f"move forward (dist {dist*100:.1f} cm)"
 
     @staticmethod
     def make_targets_3x3_ordered_like_image(
@@ -144,5 +156,6 @@ class GridNavigator:
                     u, v = uv
                     items.append((x, y, float(u), float(v)))
 
-        items.sort(key=lambda t: (-t[2], t[3]))  # rightmost first, then down
+        # Rightmost first, then top->bottom
+        items.sort(key=lambda t: (-t[2], t[3]))
         return [(x, y) for (x, y, _, _) in items]
