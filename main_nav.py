@@ -13,9 +13,11 @@ from navigator import GridNavigator, NavConfig
 WINDOW_NAME = "Kinect v2 - Navigation"
 DISPLAY_SCALE = 0.6
 
-# ---- ONE tuning knob ----
+# ---- Tuning ----
 ARUCO_STRICTNESS = 0.80
-# -------------------------
+ROBOT_ARUCO_ID = 871                 # <-- hardcode your robot ID
+PREFERRED_ARUCO_DICT = "DICT_4X4_1000"  # <-- optional, but likely correct for ID=871
+# ---------------
 
 # Floor calibration
 FIT_EVERY_N_FRAMES = 10
@@ -170,7 +172,12 @@ def main() -> int:
 
     cv2.setMouseCallback(WINDOW_NAME, on_mouse)
 
-    tracker = ArucoRobotTrackerAuto(ksys, strictness=ARUCO_STRICTNESS)
+    tracker = ArucoRobotTrackerAuto(
+        kinect_sys=ksys,
+        strictness=ARUCO_STRICTNESS,
+        robot_id=ROBOT_ARUCO_ID,
+        preferred_dict=PREFERRED_ARUCO_DICT,
+    )
 
     nav = GridNavigator(
         NavConfig(
@@ -232,7 +239,6 @@ def main() -> int:
                 targets_initialized = True
                 status_msg = "Targets set. Navigation running. Press 'n' after placing stilt."
 
-            # Goal visualization
             goal_xy = nav.current_target() if targets_initialized else None
             goal_uv = None
             if goal_xy is not None:
@@ -240,7 +246,6 @@ def main() -> int:
                 if goal_uv is not None and robot_uv is not None:
                     cv2.line(bgr, robot_uv, goal_uv, LINE_COLOR, 2, cv2.LINE_AA)
 
-            # Command output
             now = time.monotonic()
             if targets_initialized and (not paused):
                 cmd = nav.update(robot, now_s=now)
@@ -248,10 +253,10 @@ def main() -> int:
                     print(cmd)
 
             hud = [
-                f"Strictness: {ARUCO_STRICTNESS:.2f}",
+                f"Strictness: {ARUCO_STRICTNESS:.2f}  RobotID: {ROBOT_ARUCO_ID}  PrefDict: {PREFERRED_ARUCO_DICT}",
                 f"Depth: {'OK' if ksys.last_depth_1d is not None else '---'}  Plane: {'LOCKED' if ksys.plane_locked else 'CALIBRATING'}  Fits: {ksys.fit_count}/{FITS_TO_LOCK}",
                 f"Grid origin: {'SET' if ksys.grid_frame is not None else 'NOT SET'}  Robot: {'OK' if robot is not None else '---'}",
-                f"Aruco: active=({tracker.active_dict_name},{tracker.active_id})  last=({tracker.last_dict_used}) ids={tracker.last_detected_ids} perim>={tracker.min_perimeter_px:.0f}px last={tracker.last_perimeter_px:.0f}px",
+                f"Aruco: last_dict={tracker.last_dict_used} ids={tracker.last_detected_ids} perim>={tracker.min_perimeter_px:.0f}px last={tracker.last_perimeter_px:.0f}px",
                 f"Nav: {'PAUSED' if paused else 'RUNNING'}  Target: {nav.current_index + 1 if targets_initialized and not nav.is_done() else '-'} / {len(nav.targets_xy) if targets_initialized else '-'}",
                 "Keys: q/ESC quit, r recalibrate, n next target, p pause, RightClick clear origin",
             ]

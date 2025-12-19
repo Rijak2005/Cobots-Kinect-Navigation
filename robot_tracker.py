@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from collections import deque
 from dataclasses import dataclass
 from typing import Optional, Tuple, List
 
+import time
 import numpy as np
 import cv2
 
@@ -27,10 +27,6 @@ class RobotPose2D:
     confidence: float       # 0..1
 
 
-def _wrap_angle(a: float) -> float:
-    return float((a + np.pi) % (2 * np.pi) - np.pi)
-
-
 def _lerp(a: float, b: float, t: float) -> float:
     t = float(np.clip(t, 0.0, 1.0))
     return a + (b - a) * t
@@ -38,24 +34,22 @@ def _lerp(a: float, b: float, t: float) -> float:
 
 class ArucoRobotTrackerAuto:
     """
-    Fully automatic, robust ArUco robot tracker.
+    Robust, automatic ArUco robot tracking for Kinect ceiling setup.
 
-    Core idea:
-      - We DO NOT ask the user to "lock" anything.
-      - We learn the most stable (dictionary, ID) pair automatically
-        from recent detections and then follow only that pair.
-      - If it disappears for long enough, we re-learn.
-
-    One tuning knob:
-      strictness in [0..1]
-        higher => fewer false positives, more stable (but can miss if marker is tiny/blurred)
-        lower  => detects easier (but more false positives)
+    Key behaviors:
+      - Detects markers in color image (aruco).
+      - Computes robot floor position by mapping color->depth->3D->floor plane.
+      - NEVER gets stuck after temporary misses:
+          * If robot is missed or pose fails for a bit, it resets internal state.
+      - Optional hardcoded robot_id (recommended for your case: 871).
     """
 
     def __init__(
         self,
         kinect_sys: KinectGridSystem,
         strictness: float = 0.80,
+        robot_id: Optional[int] = None,              # <-- set to 871 to hardcode
+        preferred_dict: Optional[str] = None,        # e.g. "DICT_4X4_1000" (optional)
     ) -> None:
         if not hasattr(cv2, "aruco"):
             raise RuntimeError("cv2.aruco not found. Install: pip install opencv-contrib-python")
@@ -63,15 +57,19 @@ class ArucoRobotTrackerAuto:
         self.kinect_sys = kinect_sys
         self.strictness = float(np.clip(strictness, 0.0, 1.0))
 
-        # Try multiple 4x4 dictionaries (this is what makes it "work again" reliably)
+        # Hardcode ID if provided
+        self.robot_id: Optional[int] = int(robot_id) if robot_id is not None else None
+        self.preferred_dict: Optional[str] = preferred_dict
+
+        # Try multiple 4x4 dictionaries (important because your ID=871 indicates 4x4_1000 most likely)
         self.dicts: list[tuple[str, cv2.aruco.Dictionary]] = [
-            ("DICT_4X4_50", cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)),
-            ("DICT_4X4_100", cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_100)),
-            ("DICT_4X4_250", cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_250)),
             ("DICT_4X4_1000", cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_1000)),
+            ("DICT_4X4_250", cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_250)),
+            ("DICT_4X4_100", cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_100)),
+            ("DICT_4X4_50", cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)),
         ]
 
-        # Detector parameters (safe defaults)
+        # Detector parameters (safe defaults + some stability)
         self.params = cv2.aruco.DetectorParameters()
         self.params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
         self.params.cornerRefinementWinSize = 5
@@ -86,49 +84,39 @@ class ArucoRobotTrackerAuto:
         if hasattr(self.params, "detectInvertedMarker"):
             self.params.detectInvertedMarker = True
 
-        # ---- Strictness mapping (ONE knob controls these) ----
-        # minimum marker size in the COLOR image (pixel perimeter)
-        # very important: too high => "robot not found"
-        self.min_perimeter_px = _lerp(35.0, 160.0, self.strictness)
+        # ---- Single knob -> internal thresholds ----
+        # Keep min perimeter low enough that detection doesn't die.
+        self.min_perimeter_px = _lerp(45.0, 140.0, self.strictness)
 
-        # reject teleport jumps (meters)
-        self.max_jump_m = _lerp(0.90, 0.25, self.strictness)
+        # Jump reject: prevents teleporting to false spots,
+        # but we will DISABLE it during reacquisition (see below).
+        self.max_jump_m = _lerp(0.90, 0.30, self.strictness)
 
-        # smoothing amount for pose (higher strictness => smoother)
-        self.smooth_alpha = _lerp(0.30, 0.18, self.strictness)
+        # Smoothing for stability
+        self.smooth_alpha = _lerp(0.25, 0.18, self.strictness)
 
-        # depth search radius (speed + stability)
-        self.search_radius = int(round(_lerp(180.0, 75.0, self.strictness)))
+        # Depth search radius (will auto-expand on failure)
+        self.base_search_radius = int(round(_lerp(170.0, 85.0, self.strictness)))
+        # -------------------------------------------
 
-        # optional stricter decoding (if available)
-        if hasattr(self.params, "maxErroneousBitsInBorderRate"):
-            self.params.maxErroneousBitsInBorderRate = _lerp(0.35, 0.10, self.strictness)
-        if hasattr(self.params, "errorCorrectionRate"):
-            self.params.errorCorrectionRate = _lerp(0.85, 0.50, self.strictness)
-        # -----------------------------------------------------
-
-        # Learned "best" signature (dict + id) automatically
-        self.active_dict_name: Optional[str] = None
-        self.active_id: Optional[int] = None
-        self._signature_history: deque[tuple[str, int]] = deque(maxlen=40)
-
-        # Forget active target if it disappears for a while
-        self._miss_count = 0
-        self._miss_to_forget = int(round(_lerp(25, 12, self.strictness)))
-
-        # Seeds for faster color->depth matching
+        # Seeds for fast mapping color->depth
         self._seed_center_uv: Optional[Tuple[int, int]] = None
         self._seed_top_uv: Optional[Tuple[int, int]] = None
         self._seed_bottom_uv: Optional[Tuple[int, int]] = None
 
-        # Debug / HUD info
+        # Debug/HUD info
         self.last_detected_ids: list[int] = []
         self.last_dict_used: str = ""
         self.last_perimeter_px: float = 0.0
 
-        # Temporal stability
+        # Tracking state
         self._last_pose_raw: Optional[RobotPose2D] = None
         self._last_pose_smooth: Optional[RobotPose2D] = None
+
+        # Reacquisition logic:
+        self._last_good_time = 0.0
+        self._consecutive_failures = 0
+        self._failures_to_reset = 12  # ~12 frames before we reset (no stuck state)
 
     @staticmethod
     def _mid(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -137,6 +125,15 @@ class ArucoRobotTrackerAuto:
     @staticmethod
     def _perimeter(c4: np.ndarray) -> float:
         return float(np.sum(np.linalg.norm(np.roll(c4, -1, axis=0) - c4, axis=1)))
+
+    def _reset_tracking_state(self) -> None:
+        # Reset anything that can make us "stuck" after a miss
+        self._seed_center_uv = None
+        self._seed_top_uv = None
+        self._seed_bottom_uv = None
+        self._last_pose_raw = None
+        self._last_pose_smooth = None
+        self._consecutive_failures = 0
 
     def _smooth_pose(self, raw: RobotPose2D) -> RobotPose2D:
         if self._last_pose_smooth is None:
@@ -147,7 +144,7 @@ class ArucoRobotTrackerAuto:
         sx = (1 - a) * self._last_pose_smooth.x + a * raw.x
         sy = (1 - a) * self._last_pose_smooth.y + a * raw.y
 
-        # Smooth heading via unit vectors
+        # Smooth heading using unit vectors
         v_prev = np.array([np.cos(self._last_pose_smooth.heading), np.sin(self._last_pose_smooth.heading)], dtype=np.float64)
         v_new = np.array([np.cos(raw.heading), np.sin(raw.heading)], dtype=np.float64)
         v = (1 - a) * v_prev + a * v_new
@@ -167,124 +164,81 @@ class ArucoRobotTrackerAuto:
         self._last_pose_smooth = sm
         return sm
 
-    def _choose_active_signature(self) -> None:
+    def _detect_candidates(self, gray: np.ndarray):
         """
-        From recent history, pick the (dict,id) that appears most often.
-        This is the fully automatic replacement for manual locking.
+        Return list of candidates across dictionaries:
+          (dict_name, marker_id, corners4x2, perimeter_px)
         """
-        if len(self._signature_history) < 8:
-            return
-        arr = list(self._signature_history)
-        # count frequencies
-        counts: dict[tuple[str, int], int] = {}
-        for sig in arr:
-            counts[sig] = counts.get(sig, 0) + 1
-        best_sig = max(counts.items(), key=lambda kv: kv[1])[0]
-        best_count = counts[best_sig]
+        candidates = []
+        seen_ids = set()
 
-        # require consistency
-        if best_count >= 6:
-            self.active_dict_name, self.active_id = best_sig
+        dict_order = self.dicts
+        if self.preferred_dict is not None:
+            # try preferred dict first
+            pref = [d for d in self.dicts if d[0] == self.preferred_dict]
+            rest = [d for d in self.dicts if d[0] != self.preferred_dict]
+            dict_order = pref + rest
 
-    def _forget_active(self) -> None:
-        self.active_dict_name = None
-        self.active_id = None
-        self._signature_history.clear()
-        self._last_pose_raw = None
-        self._last_pose_smooth = None
-        self._seed_center_uv = None
-        self._seed_top_uv = None
-        self._seed_bottom_uv = None
+        for dict_name, d in dict_order:
+            corners_list, ids, _ = cv2.aruco.detectMarkers(gray, d, parameters=self.params)
+            if ids is None or len(ids) == 0:
+                continue
 
-    def _detect_markers(self, gray: np.ndarray):
-        """
-        Detection strategy:
-          - If we have an active dictionary, try it first.
-          - Otherwise, try all dictionaries.
-        Returns a list of detections: (dict_name, corners_list, ids)
-        """
-        dets = []
-
-        # try active dict first (fast path)
-        if self.active_dict_name is not None:
-            for name, d in self.dicts:
-                if name == self.active_dict_name:
-                    corners, ids, _ = cv2.aruco.detectMarkers(gray, d, parameters=self.params)
-                    if ids is not None and len(ids) > 0:
-                        dets.append((name, corners, ids))
-                    break
-            if dets:
-                return dets
-
-        # fall back: try all
-        for name, d in self.dicts:
-            corners, ids, _ = cv2.aruco.detectMarkers(gray, d, parameters=self.params)
-            if ids is not None and len(ids) > 0:
-                dets.append((name, corners, ids))
-        return dets
-
-    def detect_and_estimate(self, bgr: np.ndarray) -> Optional[RobotPose2D]:
-        frame: Optional[GridFrame] = self.kinect_sys.grid_frame
-        if frame is None:
-            return None
-        if self.kinect_sys.last_depth_1d is None:
-            return None
-
-        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-        detections = self._detect_markers(gray)
-
-        if not detections:
-            self.last_detected_ids = []
-            self.last_dict_used = ""
-            self._miss_count += 1
-            if self._miss_count >= self._miss_to_forget:
-                self._forget_active()
-                self._miss_count = 0
-            return None
-
-        self._miss_count = 0
-
-        # Build candidates across all dicts
-        candidates = []  # (dict_name, idx, perim_px, marker_id, corners4x2)
-        all_ids_for_hud: list[int] = []
-        for dict_name, corners_list, ids in detections:
             ids_flat = ids.flatten().astype(int)
-            all_ids_for_hud.extend(ids_flat.tolist())
+            for mid in ids_flat.tolist():
+                seen_ids.add(int(mid))
+
             for i, c in enumerate(corners_list):
                 c4 = c.reshape(4, 2).astype(np.float64)
                 per = self._perimeter(c4)
                 if per >= self.min_perimeter_px:
                     mid = int(ids_flat[i])
-                    candidates.append((dict_name, i, per, mid, c4, corners_list, ids))
+                    candidates.append((dict_name, mid, c4, float(per)))
 
-        self.last_detected_ids = sorted(list(set(all_ids_for_hud)))
+            # Optimization: if robot_id is hardcoded and we already found it in this dict, no need to try others
+            if self.robot_id is not None and any((mid == self.robot_id and dn == dict_name) for (dn, mid, _, _) in candidates):
+                self.last_dict_used = dict_name
+                self.last_detected_ids = sorted(list(seen_ids))
+                return candidates
 
-        if not candidates:
+        self.last_detected_ids = sorted(list(seen_ids))
+        return candidates
+
+    def detect_and_estimate(self, bgr: np.ndarray) -> Optional[RobotPose2D]:
+        frame: Optional[GridFrame] = self.kinect_sys.grid_frame
+        if frame is None or self.kinect_sys.last_depth_1d is None:
             return None
 
-        # Prefer active signature if set
+        now = time.monotonic()
+
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        candidates = self._detect_candidates(gray)
+
+        if not candidates:
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= self._failures_to_reset:
+                self._reset_tracking_state()
+            return None
+
+        # Choose which marker is the robot:
+        # 1) If hardcoded robot_id exists -> choose that (largest perimeter if multiple)
         chosen = None
-        if self.active_dict_name is not None and self.active_id is not None:
-            for cand in candidates:
-                if cand[0] == self.active_dict_name and cand[3] == self.active_id:
-                    chosen = cand
-                    break
+        if self.robot_id is not None:
+            same_id = [c for c in candidates if c[1] == self.robot_id]
+            if same_id:
+                chosen = max(same_id, key=lambda t: t[3])
 
-        # Otherwise choose biggest perimeter overall (best signal)
+        # 2) Otherwise choose the biggest marker (most reliable)
         if chosen is None:
-            chosen = max(candidates, key=lambda t: t[2])
+            chosen = max(candidates, key=lambda t: t[3])
 
-        dict_name, idx, perim_px, marker_id, corners4, corners_list, ids = chosen
+        dict_name, marker_id, corners, perim_px = chosen
         self.last_dict_used = dict_name
         self.last_perimeter_px = float(perim_px)
 
-        # Update signature history and possibly choose a stable signature automatically
-        self._signature_history.append((dict_name, marker_id))
-        if self.active_dict_name is None or self.active_id is None:
-            self._choose_active_signature()
+        # Confidence from marker size
+        confidence = float(np.clip(perim_px / 900.0, 0.0, 1.0))
 
-        # corners4 is shape (4,2), used for pose estimation
-        corners = corners4
         center = corners.mean(axis=0)
         top_mid = self._mid(corners[0], corners[1])
         bottom_mid = self._mid(corners[3], corners[2])
@@ -297,6 +251,7 @@ class ArucoRobotTrackerAuto:
             xy: Tuple[float, float],
             seed: Optional[Tuple[int, int]],
         ) -> Tuple[Optional[np.ndarray], Optional[Tuple[int, int]]]:
+            # Try normal search (fast)
             uv = find_depth_pixel_for_color_xy(
                 self.kinect_sys.kinect,
                 depth_1d,
@@ -304,17 +259,34 @@ class ArucoRobotTrackerAuto:
                 depth_h,
                 target_color_xy=xy,
                 seed_depth_uv=seed,
-                search_radius=self.search_radius,
+                search_radius=self.base_search_radius,
             )
             if uv is None:
-                return None, seed
+                # Retry with no seed + bigger radius (reacquisition after miss)
+                uv = find_depth_pixel_for_color_xy(
+                    self.kinect_sys.kinect,
+                    depth_1d,
+                    depth_w,
+                    depth_h,
+                    target_color_xy=xy,
+                    seed_depth_uv=None,
+                    search_radius=int(self.base_search_radius * 2.2),
+                )
+                if uv is None:
+                    return None, seed
+
             u, v = uv
             if not (0 <= u < depth_w and 0 <= v < depth_h):
                 return None, seed
+
             depth_mm = int(depth_1d[v * depth_w + u])
+            if depth_mm <= 0:
+                return None, uv
+
             p_cam = depth_pixel_to_camera_point(self.kinect_sys.kinect, u, v, depth_mm)
             if p_cam is None:
                 return None, uv
+
             p_floor = project_point_to_plane(p_cam, frame.plane)
             return p_floor, uv
 
@@ -323,6 +295,9 @@ class ArucoRobotTrackerAuto:
         p_bottom, self._seed_bottom_uv = color_xy_to_floor_point((float(bottom_mid[0]), float(bottom_mid[1])), self._seed_bottom_uv)
 
         if p_center is None or p_top is None or p_bottom is None:
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= self._failures_to_reset:
+                self._reset_tracking_state()
             return None
 
         cx, cy = camera_to_grid_xy(p_center, frame)
@@ -332,48 +307,52 @@ class ArucoRobotTrackerAuto:
         forward = np.array([tx - bx, ty - by], dtype=np.float64)
         n = float(np.linalg.norm(forward))
         if n < 1e-9:
+            self._consecutive_failures += 1
             return None
         forward /= n
         heading = float(np.arctan2(forward[1], forward[0]))
-
-        # Confidence: bigger marker => higher confidence
-        confidence = float(np.clip(perim_px / 900.0, 0.0, 1.0))
 
         raw = RobotPose2D(
             x=float(cx),
             y=float(cy),
             heading=heading,
-            marker_id=marker_id,
+            marker_id=int(marker_id),
             dict_name=dict_name,
             confidence=confidence,
         )
 
-        # Teleport rejection
-        if self._last_pose_raw is not None:
+        # If we haven't had a valid pose recently, allow "teleport" (reacquire)
+        time_since_good = now - self._last_good_time
+        allow_reacquire_jump = time_since_good > 0.6  # marker was missing/unstable
+
+        if self._last_pose_raw is not None and not allow_reacquire_jump:
             jump = float(np.hypot(raw.x - self._last_pose_raw.x, raw.y - self._last_pose_raw.y))
             if jump > self.max_jump_m:
+                self._consecutive_failures += 1
+                if self._consecutive_failures >= self._failures_to_reset:
+                    self._reset_tracking_state()
                 return None
 
+        # Success: update good-state timers/counters
         self._last_pose_raw = raw
+        self._last_good_time = now
+        self._consecutive_failures = 0
         return self._smooth_pose(raw)
 
     def draw_debug(self, img: np.ndarray) -> None:
         """
-        Draw only the currently 'best' dictionary's detections to avoid extra CPU.
+        Draw outlines for the best dictionary result. This does NOT guarantee we computed robot pose.
         """
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-        # Try active dict first
-        if self.active_dict_name is not None:
-            for name, d in self.dicts:
-                if name == self.active_dict_name:
-                    corners, ids, _ = cv2.aruco.detectMarkers(gray, d, parameters=self.params)
-                    if ids is not None:
-                        cv2.aruco.drawDetectedMarkers(img, corners, ids)
-                    return
+        # Prefer drawing from the dictionary that most recently worked
+        dict_order = self.dicts
+        if self.last_dict_used:
+            pref = [d for d in self.dicts if d[0] == self.last_dict_used]
+            rest = [d for d in self.dicts if d[0] != self.last_dict_used]
+            dict_order = pref + rest
 
-        # Otherwise draw detections from the first dict that finds anything
-        for name, d in self.dicts:
+        for dict_name, d in dict_order:
             corners, ids, _ = cv2.aruco.detectMarkers(gray, d, parameters=self.params)
             if ids is not None and len(ids) > 0:
                 cv2.aruco.drawDetectedMarkers(img, corners, ids)
