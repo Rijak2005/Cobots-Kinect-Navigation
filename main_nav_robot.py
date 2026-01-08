@@ -17,13 +17,12 @@ WINDOW_NAME = "Kinect v2 - Robot Navigation"
 DISPLAY_SCALE = 0.6
 
 # ---------------- User tuning ----------------
-ARUCO_STRICTNESS = 0.65
+ARUCO_STRICTNESS = 0.80
 ROBOT_ARUCO_ID = 871
 PREFERRED_ARUCO_DICT = "DICT_4X4_1000"
 
 POS_TOL_M = 0.05
-
-CONTROL_HZ = 10.0  # how often we compute new cmd_vel
+CONTROL_HZ = 10.0
 # --------------------------------------------
 
 # Floor calibration
@@ -122,25 +121,33 @@ def draw_robot(img: np.ndarray, robot: RobotPose2D, ksys: KinectGridSystem) -> O
 
 
 def main() -> int:
-    # Put the full wss://... url in an env var (recommended)
     # ws_url = os.environ.get("OLO_ROSBRIDGE_URL", "").strip()
     ws_url = "wss://app.olo-robotics.com/rosbridge?robotId=6800d52b-5777-4411-8ead-9aa10662def6&token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjgxYWFmZTM2LWEyNmEtNDg4Ni04NDYwLTFjMzk5YTQ5M2FkMSIsInVzZXJuYW1lIjoibGVvbi5kcmVzZWxAc3Qub3RoLXJlZ2Vuc2J1cmcuZGUiLCJpYXQiOjE3Njc4ODA0NjUsImV4cCI6MTc2Nzk2Njg2NX0.X0bNHjun6DmeQp1M8tM_2DSBsG8bZ2OCL0ATTlSl4XI"
     if not ws_url:
         print("ERROR: Please set OLO_ROSBRIDGE_URL to your wss://... rosbridge URL.")
         return 1
 
-    # Start rosbridge commander in its own thread
-    commander = RosbridgeCommander(RosbridgeConfig(url=ws_url, send_hz=10.0, verbose=True))
+    # Start rosbridge thread (this will now drain rx and keep the socket alive)
+    commander = RosbridgeCommander(
+        RosbridgeConfig(
+            url=ws_url,
+            send_hz=10.0,
+            verbose=True,
+            ping_interval_s=20.0,
+            ping_timeout_s=20.0,
+            debug_print_period_s=2.0,
+        )
+    )
     commander.start()
-    commander.set_mode("move")  # queue mode command
+    commander.set_mode("move")
 
-    # Kinect system
+    # Kinect
     ksys = KinectGridSystem(plane_smooth_alpha=0.15)
     display_w = int(ksys.color_w * DISPLAY_SCALE)
     display_h = int(ksys.color_h * DISPLAY_SCALE)
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
 
-    # Tracker + nav + controller
+    # Tracker / nav / controller
     tracker = ArucoRobotTrackerAuto(
         kinect_sys=ksys,
         strictness=ARUCO_STRICTNESS,
@@ -150,13 +157,12 @@ def main() -> int:
 
     nav = GridNavigator(
         NavConfig(
-            command_interval_s=0.25,  # only affects prints in your nav logic
+            command_interval_s=0.25,
             pos_tolerance_m=POS_TOL_M,
             turn_start_deg=30.0,
             turn_stop_deg=12.0,
         )
     )
-
     ctrl = CmdVelController(CmdVelGains())
 
     clicked_color_xy: Optional[Tuple[float, float]] = None
@@ -166,7 +172,7 @@ def main() -> int:
         nonlocal clicked_color_xy, status_msg
         if event == cv2.EVENT_LBUTTONDOWN:
             cx = float(np.clip(x / DISPLAY_SCALE, 0, ksys.color_w - 1))
-            cy = float(np.clip(y / DISPLAY_SCALE, 0, ksys.color_w - 1))
+            cy = float(np.clip(y / DISPLAY_SCALE, 0, ksys.color_h - 1))  # FIXED: uses color_h
             clicked_color_xy = (cx, cy)
             status_msg = f"Clicked grid center at ({cx:.1f}, {cy:.1f}). Setting origin..."
         if event == cv2.EVENT_RBUTTONDOWN:
@@ -180,7 +186,6 @@ def main() -> int:
     paused = False
     frame_idx = 0
 
-    # cmd_vel control tick
     dt = 1.0 / max(1e-6, CONTROL_HZ)
     next_control = time.monotonic()
 
@@ -207,7 +212,6 @@ def main() -> int:
                 continue
             bgr = bgra_to_bgr(bgra)
 
-            # set origin from click
             if clicked_color_xy is not None and ksys.grid_frame is None and ksys.plane is not None:
                 ok = ksys.set_grid_center_from_color_click(clicked_color_xy, search_radius=160)
                 status_msg = "Grid origin set. Show robot marker." if ok else "Could not set origin yet. Click again or wait."
@@ -229,7 +233,7 @@ def main() -> int:
                 )
                 nav.set_targets(targets)
                 targets_initialized = True
-                status_msg = "Targets set. Robot driving. SPACE = emergency stop."
+                status_msg = "Targets set. SPACE = emergency stop."
 
             goal_xy = nav.current_target() if targets_initialized else None
             goal_uv = None
@@ -238,7 +242,7 @@ def main() -> int:
                 if goal_uv is not None and robot_uv is not None:
                     cv2.line(bgr, robot_uv, goal_uv, LINE_COLOR, 2, cv2.LINE_AA)
 
-            # Compute/send cmd_vel at fixed rate
+            # cmd_vel tick
             now = time.monotonic()
             if now >= next_control:
                 next_control = now + dt
@@ -250,20 +254,17 @@ def main() -> int:
                     out = ctrl.compute(robot, goal_xy, pos_tol_m=POS_TOL_M)
                     if out.reached:
                         commander.stop_robot()
-                        # keep your safety workflow: stop and wait for manual 'n'
                         nav._waiting_for_stilt = True
                     else:
                         commander.send_cmd_vel(out.linear_x, out.angular_z)
 
-            # HUD
             hud = [
-                f"ROS: {'CONNECTED' if commander.is_connected() else 'DISCONNECTED'}  send_hz={CONTROL_HZ:.1f}",
-                f"RobotID: {ROBOT_ARUCO_ID}  Strictness: {ARUCO_STRICTNESS:.2f}",
+                f"ROS: {'CONNECTED' if commander.is_connected() else 'DISCONNECTED'}  mode={commander.last_mode_seen()}",
+                f"RobotID: {ROBOT_ARUCO_ID}  Strictness: {ARUCO_STRICTNESS:.2f}  ControlHz: {CONTROL_HZ:.1f}",
                 f"Depth: {'OK' if ksys.last_depth_1d is not None else '---'}  Plane: {'LOCKED' if ksys.plane_locked else 'CALIBRATING'}  Fits: {ksys.fit_count}/{FITS_TO_LOCK}",
                 f"Grid origin: {'SET' if ksys.grid_frame is not None else 'NOT SET'}  Robot: {'OK' if robot is not None else '---'}",
                 f"Aruco: last_dict={tracker.last_dict_used} ids={tracker.last_detected_ids} perim={tracker.last_perimeter_px:.0f}px",
-                f"Nav: {'PAUSED' if paused else 'RUNNING'}  Target: {nav.current_index + 1 if targets_initialized and not nav.is_done() else '-'} / {len(nav.targets_xy) if targets_initialized else '-'}",
-                "Keys: q/ESC quit, r recalibrate, n next target, p pause, SPACE emergency stop",
+                "Keys: q/ESC quit, r recalibrate, n next target, p pause, SPACE stop",
             ]
             if status_msg:
                 hud.insert(0, status_msg)
@@ -279,7 +280,6 @@ def main() -> int:
                 paused = True
                 commander.stop_robot()
                 ctrl.reset()
-
                 ksys.recalibrate_plane()
                 ksys.grid_frame = None
                 clicked_color_xy = None
@@ -297,7 +297,7 @@ def main() -> int:
                 status_msg = "All targets completed." if nav.is_done() else f"Continuing to target {nav.current_index + 1}."
             if key == 32:  # SPACE
                 paused = True
-                status_msg = "EMERGENCY STOP (paused). Press 'p' to resume."
+                status_msg = "EMERGENCY STOP. Press 'p' to resume."
                 commander.stop_robot()
                 ctrl.reset()
 
@@ -305,7 +305,6 @@ def main() -> int:
             time.sleep(0.001)
 
     finally:
-        # Always stop robot and request stand
         try:
             commander.stop_robot()
             commander.set_mode("stand")
@@ -313,7 +312,6 @@ def main() -> int:
         except Exception:
             pass
         commander.shutdown()
-
         try:
             ksys.close()
         except Exception:
