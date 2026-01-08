@@ -21,12 +21,18 @@ from olo_rosbridge import RosbridgeCommander, RosbridgeConfig
 
 # ---------------- Window / Display ----------------
 WINDOW_NAME = "Kinect v2 - Robot Mission (HOME <-> GRID)"
-DISPLAY_SCALE = 0.6
+DISPLAY_SCALE = 0.95
 
 # ---------------- Robot / ArUco ----------------
-ARUCO_STRICTNESS = 0.65
+ARUCO_STRICTNESS = 0.60
 ROBOT_ARUCO_ID = 871
 PREFERRED_ARUCO_DICT = "DICT_4X4_1000"
+
+# If arrow points backward in the window, set this to 180.0
+HEADING_OFFSET_DEG = 0.0
+
+# Reject tiny detections (helps false positives)
+MIN_MARKER_SIZE_PX = 40.0
 
 # ---------------- Grid ----------------
 GRID_SPACING_M = 0.60  # 60 cm
@@ -46,9 +52,9 @@ PAUSE_AT_HOME_S = 1.5     # simulate picking stilt
 PAUSE_AT_TARGET_S = 1.5   # simulate placing stilt
 
 # ---------------- Colors (BGR) ----------------
-POINT_COLOR = (0, 255, 0)        # grid points
-GOAL_COLOR = (0, 165, 255)       # goal marker
-HOME_COLOR = (255, 255, 0)       # home marker (cyan-ish)
+POINT_COLOR = (0, 255, 0)
+GOAL_COLOR = (0, 165, 255)
+HOME_COLOR = (255, 255, 0)
 LINE_COLOR = (0, 165, 255)
 ROBOT_COLOR = (0, 255, 255)
 HUD_COLOR = (255, 255, 255)
@@ -166,13 +172,7 @@ def draw_robot(img: np.ndarray, robot: RobotPose2D, ksys: KinectGridSystem) -> O
 
 def make_targets_row_by_row_like_image() -> List[Tuple[float, float]]:
     """
-    You asked: start far right of picture and move down row by row.
-    Our grid coordinate system:
-      +x is "right" on the image, +y is "down" if your basis was created that way.
-    Your earlier grid overlay follows image directions; so:
-      row1: (+x, -y), (0, -y), (-x, -y)
-      row2: (+x, 0),  (0, 0),  (-x, 0)
-      row3: (+x, +y), (0, +y), (-x, +y)
+    Start far right in image, go row-by-row top-to-bottom (as you requested).
     """
     s = GRID_SPACING_M
     ys = [-s, 0.0, +s]
@@ -185,7 +185,7 @@ def make_targets_row_by_row_like_image() -> List[Tuple[float, float]]:
 
 
 def main() -> int:
-    ws_url = "wss://app.olo-robotics.com/rosbridge?robotId=1ad9e8a1-047a-4903-8e50-448ebbc951df&token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjgxYWFmZTM2LWEyNmEtNDg4Ni04NDYwLTFjMzk5YTQ5M2FkMSIsInVzZXJuYW1lIjoibGVvbi5kcmVzZWxAc3Qub3RoLXJlZ2Vuc2J1cmcuZGUiLCJpYXQiOjE3Njc4OTIzMzMsImV4cCI6MTc2Nzk3ODczM30.N1cSl-bfLu_R98JkzsIWHjpR4GFG7SS_lJbtRkQee_M"
+    ws_url = os.environ.get("OLO_ROSBRIDGE_URL", "").strip()
     if not ws_url:
         print("ERROR: Please set OLO_ROSBRIDGE_URL to your wss://... rosbridge URL.")
         return 1
@@ -195,7 +195,6 @@ def main() -> int:
             url=ws_url,
             send_hz=10.0,
             verbose=True,
-            # If your gateway is picky, you can set ping_interval_s=None/ping_timeout_s=None
             ping_interval_s=20.0,
             ping_timeout_s=20.0,
             debug_print_period_s=2.0,
@@ -210,31 +209,34 @@ def main() -> int:
     display_h = int(ksys.color_h * DISPLAY_SCALE)
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
 
-    # Tracker
+    # Tracker (ONLY ID 871 + heading arrow)
     tracker = ArucoRobotTrackerAuto(
         kinect_sys=ksys,
         strictness=ARUCO_STRICTNESS,
         robot_id=ROBOT_ARUCO_ID,
         preferred_dict=PREFERRED_ARUCO_DICT,
+        heading_offset_deg=HEADING_OFFSET_DEG,
+        min_marker_size_px=MIN_MARKER_SIZE_PX,
     )
 
-    # Two-stage controller
+    # Controller (arrival hysteresis + two-stage)
     ctrl = TwoStageCmdVelController(
         TwoStageGains(
-            coarse_radius_m=0.10,
-            success_radius_m=0.04,
-            stable_reach_ticks=5,
-            # keep conservative max speed; adjust later
+            arrive_radius_m=0.08,
+            depart_radius_m=0.12,
+            stable_reach_ticks=3,
+            coarse_radius_m=0.20,
             coarse_max_lin=0.28,
             coarse_max_ang=0.85,
             fine_max_lin=0.10,
             fine_max_ang=0.45,
-            allow_reverse_fine=False,
+            disable_turn_in_place_within_m=0.15,
+            min_lin_mps=0.06,
         )
     )
 
     clicked_color_xy: Optional[Tuple[float, float]] = None
-    status_msg = "1) Wait for plane lock, 2) Left-click GRID CENTER tape."
+    status_msg = "1) Wait plane lock, 2) Left-click GRID CENTER tape."
 
     mission = Mission(home_xy=None, targets_xy=[], target_index=0, state=MissionState.NEED_HOME, state_enter_time=time.monotonic())
 
@@ -256,6 +258,7 @@ def main() -> int:
             mission.targets_xy = []
             mission.target_index = 0
             set_state(MissionState.NEED_HOME)
+            ctrl.reset()
             status_msg = "Cleared origin + HOME. Left-click GRID CENTER again."
 
     cv2.setMouseCallback(WINDOW_NAME, on_mouse)
@@ -295,7 +298,7 @@ def main() -> int:
             if clicked_color_xy is not None and ksys.grid_frame is None and ksys.plane is not None:
                 ok = ksys.set_grid_center_from_color_click(clicked_color_xy, search_radius=160)
                 if ok:
-                    status_msg = "Grid origin set ✅. Now RIGHT-CLICK HOME position on floor."
+                    status_msg = "Grid origin set ✅. Put robot at HOME and press 'h'."
                     set_state(MissionState.NEED_HOME)
                 else:
                     status_msg = "Could not set origin yet. Click again or wait."
@@ -307,39 +310,38 @@ def main() -> int:
             # --- draw grid overlay ---
             draw_grid_points(bgr, ksys, GRID_SPACING_M)
 
-            # --- tracking ---
+            # --- tracking (ONLY marker 871) ---
             robot: Optional[RobotPose2D] = tracker.detect_and_estimate(bgr)
+
+            # Draw ONLY marker 871 + heading arrow (no other detections)
             tracker.draw_debug(bgr)
+
             robot_uv = draw_robot(bgr, robot, ksys) if robot is not None else None
 
-            # --- HOME selection (right click) ---
-            # We already used right click to clear everything; so use key 'h' to set HOME at robot position.
-            # This avoids confusing UI and makes HOME easy: just put robot at home station and press 'h'.
-            # (Less clicking on floor.)
-            #
-            # If you prefer mouse-based home marking, tell me and I’ll add it back.
+            # If robot not visible: pause + stop (your requirement)
+            if robot is None and mission.state not in (MissionState.NEED_HOME, MissionState.DONE):
+                paused = True
+                set_state(MissionState.PAUSED)
+                status_msg = "Robot marker 871 not visible -> PAUSED (stopping)."
+
+            # Draw HOME marker if set
             if mission.home_xy is not None:
                 draw_goal_point(bgr, ksys, mission.home_xy, "HOME", HOME_COLOR)
 
-            # --- create targets once we have origin + home ---
+            # Create targets once we have origin + home
             if ksys.grid_frame is not None and mission.home_xy is not None and not mission.targets_xy:
                 mission.targets_xy = make_targets_row_by_row_like_image()
                 mission.target_index = 0
                 set_state(MissionState.GO_HOME)
                 status_msg = "Targets generated. Going HOME first."
 
-            # --- mission goal selection ---
+            # Decide active goal based on mission state
             current_target = mission.current_target()
             active_goal_xy: Optional[Tuple[float, float]] = None
             goal_label = ""
 
-            if paused:
-                set_state(MissionState.PAUSED)
-
             if mission.state == MissionState.NEED_HOME:
-                # no driving
                 active_goal_xy = None
-                goal_label = ""
             elif mission.state in (MissionState.GO_HOME, MissionState.WAIT_HOME):
                 active_goal_xy = mission.home_xy
                 goal_label = "HOME"
@@ -347,9 +349,8 @@ def main() -> int:
                 active_goal_xy = current_target
                 goal_label = f"T{mission.target_index+1}"
             elif mission.state == MissionState.DONE:
-                active_goal_xy = mission.home_xy
-                goal_label = "HOME"
-            else:
+                active_goal_xy = None
+            elif mission.state == MissionState.PAUSED:
                 active_goal_xy = None
 
             goal_uv = None
@@ -364,11 +365,12 @@ def main() -> int:
             if now >= next_control:
                 next_control = now + dt
 
-                if paused or (not commander.is_connected()) or ksys.grid_frame is None:
+                safe_stop = paused or (not commander.is_connected()) or ksys.grid_frame is None or (robot is None)
+                if safe_stop:
                     commander.stop_robot()
                     ctrl.reset()
                 else:
-                    # Decide what the robot should do based on mission state.
+                    # Mission logic
                     if mission.state == MissionState.NEED_HOME:
                         commander.stop_robot()
                         ctrl.reset()
@@ -379,18 +381,19 @@ def main() -> int:
                             commander.stop_robot()
                             ctrl.reset()
                             set_state(MissionState.WAIT_HOME)
+                            status_msg = "At HOME. Simulating pick-up..."
                         else:
                             commander.send_cmd_vel(out.linear_x, out.angular_z)
 
                     elif mission.state == MissionState.WAIT_HOME:
                         commander.stop_robot()
-                        # simulate "pick stilt"
                         if (now - mission.state_enter_time) >= PAUSE_AT_HOME_S:
-                            # after home wait -> go to target if any left
                             if current_target is None:
                                 set_state(MissionState.DONE)
+                                status_msg = "No targets. DONE."
                             else:
                                 set_state(MissionState.GO_TARGET)
+                                status_msg = f"Going to target {mission.target_index+1}..."
 
                     elif mission.state == MissionState.GO_TARGET:
                         out = ctrl.compute(robot, current_target)
@@ -398,21 +401,21 @@ def main() -> int:
                             commander.stop_robot()
                             ctrl.reset()
                             set_state(MissionState.WAIT_TARGET)
+                            status_msg = f"At target {mission.target_index+1}. Simulating place..."
                         else:
                             commander.send_cmd_vel(out.linear_x, out.angular_z)
 
                     elif mission.state == MissionState.WAIT_TARGET:
                         commander.stop_robot()
-                        # simulate "place stilt"
                         if (now - mission.state_enter_time) >= PAUSE_AT_TARGET_S:
-                            # Finished placing -> return HOME
+                            # finished placing -> advance to next target, go home
                             mission.target_index += 1
                             if mission.current_target() is None:
-                                # All targets done -> return home and stop
                                 set_state(MissionState.GO_HOME)
                                 status_msg = "All targets done. Returning HOME."
                             else:
                                 set_state(MissionState.GO_HOME)
+                                status_msg = "Returning HOME for next stilt..."
 
                     elif mission.state == MissionState.DONE:
                         commander.stop_robot()
@@ -427,10 +430,10 @@ def main() -> int:
             hud = [
                 f"ROS: {'CONNECTED' if commander.is_connected() else 'DISCONNECTED'}  mode={mode_seen}",
                 f"Mission: {mission.state}  target={mission.target_index+1 if mission.current_target() else '-'} / {len(mission.targets_xy) if mission.targets_xy else '-'}",
-                f"Home: {'SET' if mission.home_xy is not None else 'NOT SET'}  GridOrigin: {'SET' if ksys.grid_frame is not None else 'NOT SET'}",
-                f"Robot: {'OK' if robot is not None else '---'}  ArucoID={ROBOT_ARUCO_ID} strict={ARUCO_STRICTNESS:.2f}",
+                f"Home: {'SET' if mission.home_xy else 'NOT SET'}  GridOrigin: {'SET' if ksys.grid_frame else 'NOT SET'}",
+                f"Robot871: {'OK' if robot else '---'}  strict={ARUCO_STRICTNESS:.2f}  heading_offset={HEADING_OFFSET_DEG:.0f}deg",
                 f"Plane: {'LOCKED' if ksys.plane_locked else 'CALIBRATING'}  Fits: {ksys.fit_count}/{FITS_TO_LOCK}",
-                "Keys: q/ESC quit, p pause, SPACE emergency stop, r recalibrate, h set HOME at robot position",
+                "Keys: q/ESC quit, p toggle pause, SPACE stop, r recalibrate, h set HOME at robot position",
             ]
             if status_msg:
                 hud.insert(0, status_msg)
@@ -439,6 +442,7 @@ def main() -> int:
             disp = cv2.resize(bgr, (display_w, display_h), interpolation=cv2.INTER_AREA)
             cv2.imshow(WINDOW_NAME, disp)
 
+            # --- keyboard ---
             key = cv2.waitKey(1) & 0xFF
             if key in (27, ord("q")):
                 break
@@ -452,10 +456,10 @@ def main() -> int:
                     ctrl.reset()
                 else:
                     status_msg = "Resumed."
-                    # resume into a safe state
+                    # resume safely
                     if mission.home_xy is None:
                         set_state(MissionState.NEED_HOME)
-                    elif mission.targets_xy and mission.current_target() is not None:
+                    elif mission.targets_xy:
                         set_state(MissionState.GO_HOME)
                     else:
                         set_state(MissionState.GO_HOME)
@@ -471,31 +475,33 @@ def main() -> int:
                 paused = True
                 commander.stop_robot()
                 ctrl.reset()
+
                 ksys.recalibrate_plane()
                 ksys.grid_frame = None
                 clicked_color_xy = None
+
                 mission.home_xy = None
                 mission.targets_xy = []
                 mission.target_index = 0
                 set_state(MissionState.NEED_HOME)
-                status_msg = "Recalibrating plane. Left-click GRID CENTER again."
+                status_msg = "Recalibrating. Left-click GRID CENTER again."
 
             if key == ord("h"):
-                # Set HOME at the robot's current (x,y) in grid coordinates.
                 if robot is not None:
                     mission.home_xy = (float(robot.x), float(robot.y))
                     status_msg = f"HOME set at robot position: x={mission.home_xy[0]:+.2f}, y={mission.home_xy[1]:+.2f}"
-                    if ksys.grid_frame is not None and not mission.targets_xy:
-                        # targets will be generated automatically in loop
-                        pass
+                    paused = False
+                    if mission.targets_xy:
+                        set_state(MissionState.GO_HOME)
+                    else:
+                        set_state(MissionState.NEED_HOME)
                 else:
-                    status_msg = "Cannot set HOME: robot not visible."
+                    status_msg = "Cannot set HOME: robot 871 not visible."
 
             frame_idx += 1
             time.sleep(0.001)
 
     finally:
-        # Always stop robot and request stand
         try:
             commander.stop_robot()
             commander.set_mode("stand")

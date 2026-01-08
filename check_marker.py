@@ -30,17 +30,17 @@ def filter_by_size(corners: np.ndarray) -> bool:
     side_lengths = [np.linalg.norm(pts[i] - pts[(i + 1) % 4]) for i in range(4)]
     return np.mean(side_lengths) >= MIN_MARKER_SIZE_PX
 
-def detect_ids(detector: cv2.aruco.ArucoDetector, gray: np.ndarray) -> list[int]:
+def detect_markers(detector: cv2.aruco.ArucoDetector, gray: np.ndarray) -> list[tuple[int, np.ndarray]]:
     corners, ids, _ = detector.detectMarkers(gray)
     if ids is None:
         return []
-    kept = []
+    kept: list[tuple[int, np.ndarray]] = []
     for c, mid in zip(corners, ids.flatten()):
         if ALLOWED_IDS is not None and mid not in ALLOWED_IDS:
             continue
         if not filter_by_size(c):
             continue
-        kept.append(int(mid))
+        kept.append((int(mid), c))
     return kept
 
 def main() -> None:
@@ -62,7 +62,27 @@ def main() -> None:
             if not ok:
                 continue
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            ids = detect_ids(detector, gray)
+
+            markers = detect_markers(detector, gray)
+            ids = [m[0] for m in markers]
+
+            for mid, c in markers:
+                pts = c.reshape(-1, 2).astype(int)
+                cv2.polylines(frame, [pts], True, (0, 255, 0), 2)
+                center = np.mean(pts, axis=0)
+                top_mid = (pts[0] + pts[1]) / 2.0
+                dir_vec = top_mid - center
+                arrow_end = center + 1.5 * dir_vec
+                cv2.circle(frame, tuple(center.astype(int)), 4, (0, 0, 255), -1)
+                cv2.arrowedLine(
+                    frame,
+                    tuple(center.astype(int)),
+                    tuple(arrow_end.astype(int)),
+                    (255, 0, 0),
+                    2,
+                    tipLength=0.25,
+                )
+                cv2.putText(frame, f"ID: {mid}", tuple(pts[0]), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
             now = time.time()
             if ids != last_ids and now - last_time > debounce_sec:
