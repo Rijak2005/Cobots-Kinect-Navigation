@@ -126,7 +126,8 @@ async def run() -> int:
     # 1) Read websocket URL from environment (recommended).
     #    Set it in PowerShell:
     #      $env:OLO_ROSBRIDGE_URL="wss://..."
-    ws_url = os.environ.get("OLO_ROSBRIDGE_URL", "").strip()
+    # ws_url = os.environ.get("OLO_ROSBRIDGE_URL", "").strip()
+    ws_url = "wss://app.olo-robotics.com/rosbridge?robotId=6800d52b-5777-4411-8ead-9aa10662def6&token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjgxYWFmZTM2LWEyNmEtNDg4Ni04NDYwLTFjMzk5YTQ5M2FkMSIsInVzZXJuYW1lIjoibGVvbi5kcmVzZWxAc3Qub3RoLXJlZ2Vuc2J1cmcuZGUiLCJpYXQiOjE3Njc4ODA0NjUsImV4cCI6MTc2Nzk2Njg2NX0.X0bNHjun6DmeQp1M8tM_2DSBsG8bZ2OCL0ATTlSl4XI"
     if not ws_url:
         print("ERROR: Please set OLO_ROSBRIDGE_URL environment variable to your wss://... rosbridge URL.")
         return 1
