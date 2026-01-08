@@ -1,0 +1,19 @@
+[rosbridge] connecting...
+[rosbridge] connected ✅
+[rosbridge] set_mode -> move
+[rosbridge] set_mode -> move
+[rosbridge] connection error: ConnectionClosedError(None, Close(code=<CloseCode.INTERNAL_ERROR: 1011>, reason='keepalive ping timeout'), None)
+[rosbridge] connecting...
+[rosbridge] connected ✅
+[rosbridge] connection error: ConnectionClosedError(None, Close(code=<CloseCode.INTERNAL_ERROR: 1011>, reason='keepalive ping timeout'), None)
+[rosbridge] connecting...
+[rosbridge] connected ✅
+[rosbridge] connection error: ConnectionClosedError(None, Close(code=<CloseCode.INTERNAL_ERROR: 1011>, reason='keepalive ping timeout'), None)
+[rosbridge] connecting...
+[rosbridge] connected ✅
+[rosbridge] connection error: ConnectionClosedError(None, Close(code=<CloseCode.INTERNAL_ERROR: 1011>, reason='keepalive ping timeout'), None)
+[rosbridge] connecting...
+[rosbridge] connected ✅
+[rosbridge] connection error: ConnectionClosedError(None, Close(code=<CloseCode.INTERNAL_ERROR: 1011>, reason='keepalive ping timeout'), None)
+[rosbridge] connecting...
+[rosbridge] connected ✅
