@@ -185,7 +185,7 @@ def make_targets_row_by_row_like_image() -> List[Tuple[float, float]]:
 
 
 def main() -> int:
-    ws_url = "wss://app.olo-robotics.com/rosbridge?robotId=6800d52b-5777-4411-8ead-9aa10662def6&token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjgxYWFmZTM2LWEyNmEtNDg4Ni04NDYwLTFjMzk5YTQ5M2FkMSIsInVzZXJuYW1lIjoibGVvbi5kcmVzZWxAc3Qub3RoLXJlZ2Vuc2J1cmcuZGUiLCJpYXQiOjE3Njc4ODA0NjUsImV4cCI6MTc2Nzk2Njg2NX0.X0bNHjun6DmeQp1M8tM_2DSBsG8bZ2OCL0ATTlSl4XI"
+    ws_url = "wss://app.olo-robotics.com/rosbridge?robotId=1ad9e8a1-047a-4903-8e50-448ebbc951df&token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjgxYWFmZTM2LWEyNmEtNDg4Ni04NDYwLTFjMzk5YTQ5M2FkMSIsInVzZXJuYW1lIjoibGVvbi5kcmVzZWxAc3Qub3RoLXJlZ2Vuc2J1cmcuZGUiLCJpYXQiOjE3Njc4OTIzMzMsImV4cCI6MTc2Nzk3ODczM30.N1cSl-bfLu_R98JkzsIWHjpR4GFG7SS_lJbtRkQee_M"
     if not ws_url:
         print("ERROR: Please set OLO_ROSBRIDGE_URL to your wss://... rosbridge URL.")
         return 1
