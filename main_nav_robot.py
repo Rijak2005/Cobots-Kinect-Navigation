@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import os
 import time
 from typing import Optional, Tuple
 
@@ -9,15 +11,21 @@ import numpy as np
 from grid_core import KinectGridSystem, map_camera_point_to_color_xy, grid_xy_to_camera
 from robot_tracker import ArucoRobotTrackerAuto, RobotPose2D
 from navigator import GridNavigator, NavConfig
+from cmd_vel_controller import CmdVelController, CmdVelGains
+from olo_rosbridge import OloRosbridgeClient, RosbridgeConfig
 
-WINDOW_NAME = "Kinect v2 - Navigation"
+WINDOW_NAME = "Kinect v2 - Robot Navigation"
 DISPLAY_SCALE = 0.6
 
-# ---- Tuning ----
-ARUCO_STRICTNESS = 0.80
-ROBOT_ARUCO_ID = 871                 # <-- hardcode your robot ID
-PREFERRED_ARUCO_DICT = "DICT_4X4_1000"  # <-- optional, but likely correct for ID=871
-# ---------------
+# ---------------- User tuning ----------------
+ARUCO_STRICTNESS = 0.65
+ROBOT_ARUCO_ID = 871
+PREFERRED_ARUCO_DICT = "DICT_4X4_1000"  # optional but matches ID range
+
+# Navigation tolerances
+POS_TOL_M = 0.05           # 5 cm
+CONTROL_HZ = 10.0          # cmd_vel update rate
+# --------------------------------------------
 
 # Floor calibration
 FIT_EVERY_N_FRAMES = 10
@@ -35,8 +43,6 @@ POINT_COLOR = (0, 255, 0)
 GOAL_COLOR = (0, 165, 255)     # orange
 LINE_COLOR = (0, 165, 255)
 ROBOT_COLOR = (0, 255, 255)    # yellow
-AXIS_X_COLOR = (0, 0, 255)
-AXIS_Y_COLOR = (255, 0, 0)
 HUD_COLOR = (255, 255, 255)
 CLICK_COLOR = (255, 0, 255)
 
@@ -59,26 +65,10 @@ def draw_marker_cross(img: np.ndarray, x: float, y: float, color=CLICK_COLOR) ->
         cv2.drawMarker(img, (xi, yi), color, markerType=cv2.MARKER_CROSS, markerSize=30, thickness=2)
 
 
-def draw_grid_overlay(img: np.ndarray, ksys: KinectGridSystem, spacing_m: float) -> None:
+def draw_grid_points(img: np.ndarray, ksys: KinectGridSystem, spacing_m: float) -> None:
     frame = ksys.grid_frame
     if frame is None:
         return
-
-    origin_uv = map_camera_point_to_color_xy(ksys.kinect, frame.origin_cam)
-    if origin_uv is not None:
-        ox, oy = int(origin_uv[0]), int(origin_uv[1])
-        cv2.circle(img, (ox, oy), 7, (255, 255, 255), -1, cv2.LINE_AA)
-
-        x_end = frame.origin_cam + 1.0 * frame.e1
-        y_end = frame.origin_cam + 1.0 * frame.e2
-        x_uv = map_camera_point_to_color_xy(ksys.kinect, x_end)
-        y_uv = map_camera_point_to_color_xy(ksys.kinect, y_end)
-
-        if x_uv is not None:
-            cv2.arrowedLine(img, (ox, oy), (int(x_uv[0]), int(x_uv[1])), AXIS_X_COLOR, 2, cv2.LINE_AA, tipLength=0.03)
-        if y_uv is not None:
-            cv2.arrowedLine(img, (ox, oy), (int(y_uv[0]), int(y_uv[1])), AXIS_Y_COLOR, 2, cv2.LINE_AA, tipLength=0.03)
-
     for y in (-spacing_m, 0.0, spacing_m):
         for x in (-spacing_m, 0.0, spacing_m):
             p_cam = grid_xy_to_camera(x, y, frame)
@@ -107,32 +97,20 @@ def draw_goal(img: np.ndarray, ksys: KinectGridSystem, goal_xy: Tuple[float, flo
     return None
 
 
-def draw_robot_overlay(img: np.ndarray, robot: RobotPose2D, ksys: KinectGridSystem) -> Optional[Tuple[int, int]]:
+def draw_robot(img: np.ndarray, robot: RobotPose2D, ksys: KinectGridSystem) -> Optional[Tuple[int, int]]:
     frame = ksys.grid_frame
     if frame is None:
         return None
-
     p_cam = grid_xy_to_camera(robot.x, robot.y, frame)
     uv = map_camera_point_to_color_xy(ksys.kinect, p_cam)
     if uv is None:
         return None
-
     u, v = int(uv[0]), int(uv[1])
     if 0 <= u < img.shape[1] and 0 <= v < img.shape[0]:
         cv2.circle(img, (u, v), 8, ROBOT_COLOR, -1, cv2.LINE_AA)
-
-        # heading arrow
-        arrow_len = 0.20
-        hx = robot.x + arrow_len * float(np.cos(robot.heading))
-        hy = robot.y + arrow_len * float(np.sin(robot.heading))
-        p_head = grid_xy_to_camera(hx, hy, frame)
-        uvh = map_camera_point_to_color_xy(ksys.kinect, p_head)
-        if uvh is not None:
-            cv2.arrowedLine(img, (u, v), (int(uvh[0]), int(uvh[1])), ROBOT_COLOR, 2, cv2.LINE_AA, tipLength=0.2)
-
         cv2.putText(
             img,
-            f"Robot: x={robot.x:+.2f} y={robot.y:+.2f} conf={robot.confidence:.2f} id={robot.marker_id} {robot.dict_name}",
+            f"Robot: x={robot.x:+.2f} y={robot.y:+.2f} conf={robot.confidence:.2f}",
             (u + 10, v - 10),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,
@@ -144,17 +122,57 @@ def draw_robot_overlay(img: np.ndarray, robot: RobotPose2D, ksys: KinectGridSyst
     return None
 
 
-def main() -> int:
-    if not hasattr(cv2, "aruco"):
-        print("ERROR: cv2.aruco missing. Install: pip install opencv-contrib-python")
+async def run() -> int:
+    # 1) Read websocket URL from environment (recommended).
+    #    Set it in PowerShell:
+    #      $env:OLO_ROSBRIDGE_URL="wss://..."
+    ws_url = os.environ.get("OLO_ROSBRIDGE_URL", "").strip()
+    if not ws_url:
+        print("ERROR: Please set OLO_ROSBRIDGE_URL environment variable to your wss://... rosbridge URL.")
         return 1
 
+    # 2) Connect rosbridge
+    client = OloRosbridgeClient(RosbridgeConfig(url=ws_url))
+    print("Connecting to robot rosbridge...")
+    await client.connect()
+    print("Connected.")
+
+    # Advertise topics we will publish
+    await client.advertise("/cmd_vel", "geometry_msgs/msg/Twist")
+    await client.advertise("/set_mode_cmd", "std_msgs/msg/String")
+
+    # Set mode to move (matches your example script)
+    current_mode = await client.get_current_mode()
+    print("Robot current mode:", current_mode)
+    print("Setting robot mode to 'move' ...")
+    await client.set_mode("move")
+    await asyncio.sleep(1.0)
+
+    # 3) Init Kinect system
     ksys = KinectGridSystem(plane_smooth_alpha=0.15)
     display_w = int(ksys.color_w * DISPLAY_SCALE)
     display_h = int(ksys.color_h * DISPLAY_SCALE)
-
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
 
+    # 4) Tracker + Navigator + Controller
+    tracker = ArucoRobotTrackerAuto(
+        kinect_sys=ksys,
+        strictness=ARUCO_STRICTNESS,
+        robot_id=ROBOT_ARUCO_ID,
+        preferred_dict=PREFERRED_ARUCO_DICT,
+    )
+
+    nav = GridNavigator(
+        NavConfig(
+            command_interval_s=0.25,   # still prints status at this interval (optional)
+            pos_tolerance_m=POS_TOL_M,
+            turn_start_deg=30.0,
+            turn_stop_deg=12.0,
+        )
+    )
+    ctrl = CmdVelController(CmdVelGains())
+
+    # Clicked grid center
     clicked_color_xy: Optional[Tuple[float, float]] = None
     status_msg = "1) Wait for plane lock, 2) Left-click taped grid center."
 
@@ -172,29 +190,19 @@ def main() -> int:
 
     cv2.setMouseCallback(WINDOW_NAME, on_mouse)
 
-    tracker = ArucoRobotTrackerAuto(
-        kinect_sys=ksys,
-        strictness=ARUCO_STRICTNESS,
-        robot_id=ROBOT_ARUCO_ID,
-        preferred_dict=PREFERRED_ARUCO_DICT,
-    )
-
-    nav = GridNavigator(
-        NavConfig(
-            command_interval_s=0.25,
-            pos_tolerance_m=0.05,
-            turn_start_deg=30.0,
-            turn_stop_deg=12.0,
-        )
-    )
     targets_initialized = False
     paused = False
     frame_idx = 0
 
+    # Control loop timing
+    dt = 1.0 / CONTROL_HZ
+    next_control_time = time.monotonic()
+
     try:
         while True:
+            # --- Kinect update ---
             if not ksys.update_frames():
-                time.sleep(0.002)
+                await asyncio.sleep(0.002)
                 continue
 
             ksys.try_update_plane(
@@ -210,25 +218,26 @@ def main() -> int:
 
             bgra = ksys.get_color_bgr()
             if bgra is None:
+                await asyncio.sleep(0.002)
                 continue
             bgr = bgra_to_bgr(bgra)
 
+            # set origin from click
             if clicked_color_xy is not None and ksys.grid_frame is None and ksys.plane is not None:
                 ok = ksys.set_grid_center_from_color_click(clicked_color_xy, search_radius=160)
-                status_msg = "Grid origin set. Show marker." if ok else "Could not set origin yet. Click again or wait."
+                status_msg = "Grid origin set. Show robot marker." if ok else "Could not set origin yet. Click again or wait."
 
             if clicked_color_xy is not None:
                 draw_marker_cross(bgr, clicked_color_xy[0], clicked_color_xy[1])
 
-            draw_grid_overlay(bgr, ksys, GRID_SPACING_M)
+            draw_grid_points(bgr, ksys, GRID_SPACING_M)
 
-            robot = tracker.detect_and_estimate(bgr)
+            # --- Tracking ---
+            robot: Optional[RobotPose2D] = tracker.detect_and_estimate(bgr)
             tracker.draw_debug(bgr)
+            robot_uv = draw_robot(bgr, robot, ksys) if robot is not None else None
 
-            robot_uv = None
-            if robot is not None:
-                robot_uv = draw_robot_overlay(bgr, robot, ksys)
-
+            # --- Targets init ---
             if (not targets_initialized) and (ksys.grid_frame is not None):
                 targets = nav.make_targets_3x3_ordered_like_image(
                     frame=ksys.grid_frame,
@@ -237,7 +246,7 @@ def main() -> int:
                 )
                 nav.set_targets(targets)
                 targets_initialized = True
-                status_msg = "Targets set. Navigation running. Press 'n' after placing stilt."
+                status_msg = "Targets set. Robot driving. Press 'n' after placing stilt (or when safe)."
 
             goal_xy = nav.current_target() if targets_initialized else None
             goal_uv = None
@@ -246,19 +255,35 @@ def main() -> int:
                 if goal_uv is not None and robot_uv is not None:
                     cv2.line(bgr, robot_uv, goal_uv, LINE_COLOR, 2, cv2.LINE_AA)
 
+            # --- Control tick (send cmd_vel) ---
             now = time.monotonic()
-            if targets_initialized and (not paused):
-                cmd = nav.update(robot, now_s=now)
-                if cmd:
-                    print(cmd)
+            if now >= next_control_time:
+                next_control_time = now + dt
 
+                if paused or (not targets_initialized) or (ksys.grid_frame is None):
+                    await client.send_cmd_vel(0.0, 0.0)
+                    ctrl.reset()
+                else:
+                    out = ctrl.compute(robot, goal_xy, pos_tol_m=POS_TOL_M)
+
+                    # If reached: stop and wait for 'n' like before (safe)
+                    if out.reached:
+                        await client.send_cmd_vel(0.0, 0.0)
+                        nav._waiting_for_stilt = True  # keep existing workflow
+                    else:
+                        await client.send_cmd_vel(out.linear_x, out.angular_z)
+
+                    # Optional: print status
+                    # print(out.status)
+
+            # --- HUD ---
             hud = [
-                f"Strictness: {ARUCO_STRICTNESS:.2f}  RobotID: {ROBOT_ARUCO_ID}  PrefDict: {PREFERRED_ARUCO_DICT}",
+                f"RobotID: {ROBOT_ARUCO_ID}  Strictness: {ARUCO_STRICTNESS:.2f}  CtrlHz: {CONTROL_HZ:.1f}",
                 f"Depth: {'OK' if ksys.last_depth_1d is not None else '---'}  Plane: {'LOCKED' if ksys.plane_locked else 'CALIBRATING'}  Fits: {ksys.fit_count}/{FITS_TO_LOCK}",
                 f"Grid origin: {'SET' if ksys.grid_frame is not None else 'NOT SET'}  Robot: {'OK' if robot is not None else '---'}",
-                f"Aruco: last_dict={tracker.last_dict_used} ids={tracker.last_detected_ids} perim>={tracker.min_perimeter_px:.0f}px last={tracker.last_perimeter_px:.0f}px",
+                f"Aruco: last_dict={tracker.last_dict_used} ids={tracker.last_detected_ids} perim={tracker.last_perimeter_px:.0f}px",
                 f"Nav: {'PAUSED' if paused else 'RUNNING'}  Target: {nav.current_index + 1 if targets_initialized and not nav.is_done() else '-'} / {len(nav.targets_xy) if targets_initialized else '-'}",
-                "Keys: q/ESC quit, r recalibrate, n next target, p pause, RightClick clear origin",
+                "Keys: q/ESC quit, r recalibrate, n next target, p pause, SPACE emergency stop",
             ]
             if status_msg:
                 hud.insert(0, status_msg)
@@ -276,22 +301,43 @@ def main() -> int:
                 clicked_color_xy = None
                 targets_initialized = False
                 status_msg = "Recalibrating plane. After lock, click taped grid center again."
+                await client.send_cmd_vel(0.0, 0.0)
+                ctrl.reset()
             if key == ord("p"):
                 paused = not paused
                 status_msg = "Paused." if paused else "Resumed."
+                if paused:
+                    await client.send_cmd_vel(0.0, 0.0)
+                    ctrl.reset()
             if key == ord("n"):
                 nav.confirm_stilt_and_advance()
+                ctrl.reset()
                 status_msg = "All targets completed." if nav.is_done() else f"Continuing to target {nav.current_index + 1}."
+            if key == 32:  # SPACE
+                paused = True
+                status_msg = "EMERGENCY STOP (paused). Press 'p' to resume."
+                await client.send_cmd_vel(0.0, 0.0)
+                ctrl.reset()
 
             frame_idx += 1
-            time.sleep(0.001)
+            await asyncio.sleep(0.001)
 
     finally:
-        ksys.close()
+        # Always stop robot and set safe mode
+        try:
+            await client.stop()
+            await client.set_mode("stand")
+        except Exception:
+            pass
+        try:
+            ksys.close()
+        except Exception:
+            pass
         cv2.destroyAllWindows()
+        await client.close()
 
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(asyncio.run(run()))
