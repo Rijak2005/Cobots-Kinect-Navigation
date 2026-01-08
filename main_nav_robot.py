@@ -24,7 +24,7 @@ WINDOW_NAME = "Kinect v2 - Robot Mission (HOME <-> GRID)"
 DISPLAY_SCALE = 0.6
 
 # ---------------- Robot / ArUco ----------------
-ARUCO_STRICTNESS = 0.80
+ARUCO_STRICTNESS = 0.65
 ROBOT_ARUCO_ID = 871
 PREFERRED_ARUCO_DICT = "DICT_4X4_1000"
 
