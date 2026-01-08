@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import os
 import time
 from typing import Optional, Tuple
@@ -12,19 +11,19 @@ from grid_core import KinectGridSystem, map_camera_point_to_color_xy, grid_xy_to
 from robot_tracker import ArucoRobotTrackerAuto, RobotPose2D
 from navigator import GridNavigator, NavConfig
 from cmd_vel_controller import CmdVelController, CmdVelGains
-from olo_rosbridge import OloRosbridgeClient, RosbridgeConfig
+from olo_rosbridge import RosbridgeCommander, RosbridgeConfig
 
 WINDOW_NAME = "Kinect v2 - Robot Navigation"
 DISPLAY_SCALE = 0.6
 
 # ---------------- User tuning ----------------
-ARUCO_STRICTNESS = 0.65
+ARUCO_STRICTNESS = 0.80
 ROBOT_ARUCO_ID = 871
-PREFERRED_ARUCO_DICT = "DICT_4X4_1000"  # optional but matches ID range
+PREFERRED_ARUCO_DICT = "DICT_4X4_1000"
 
-# Navigation tolerances
-POS_TOL_M = 0.05           # 5 cm
-CONTROL_HZ = 10.0          # cmd_vel update rate
+POS_TOL_M = 0.05
+
+CONTROL_HZ = 10.0  # how often we compute new cmd_vel
 # --------------------------------------------
 
 # Floor calibration
@@ -122,40 +121,25 @@ def draw_robot(img: np.ndarray, robot: RobotPose2D, ksys: KinectGridSystem) -> O
     return None
 
 
-async def run() -> int:
-    # 1) Read websocket URL from environment (recommended).
-    #    Set it in PowerShell:
-    #      $env:OLO_ROSBRIDGE_URL="wss://..."
-    # ws_url = os.environ.get("OLO_ROSBRIDGE_URL", "").strip()
-    ws_url = "wss://app.olo-robotics.com/rosbridge?robotId=6800d52b-5777-4411-8ead-9aa10662def6&token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjgxYWFmZTM2LWEyNmEtNDg4Ni04NDYwLTFjMzk5YTQ5M2FkMSIsInVzZXJuYW1lIjoibGVvbi5kcmVzZWxAc3Qub3RoLXJlZ2Vuc2J1cmcuZGUiLCJpYXQiOjE3Njc4ODA0NjUsImV4cCI6MTc2Nzk2Njg2NX0.X0bNHjun6DmeQp1M8tM_2DSBsG8bZ2OCL0ATTlSl4XI"
+def main() -> int:
+    # Put the full wss://... url in an env var (recommended)
+    ws_url = os.environ.get("OLO_ROSBRIDGE_URL", "").strip()
     if not ws_url:
-        print("ERROR: Please set OLO_ROSBRIDGE_URL environment variable to your wss://... rosbridge URL.")
+        print("ERROR: Please set OLO_ROSBRIDGE_URL to your wss://... rosbridge URL.")
         return 1
 
-    # 2) Connect rosbridge
-    client = OloRosbridgeClient(RosbridgeConfig(url=ws_url))
-    print("Connecting to robot rosbridge...")
-    await client.connect()
-    print("Connected.")
+    # Start rosbridge commander in its own thread
+    commander = RosbridgeCommander(RosbridgeConfig(url=ws_url, send_hz=10.0, verbose=True))
+    commander.start()
+    commander.set_mode("move")  # queue mode command
 
-    # Advertise topics we will publish
-    await client.advertise("/cmd_vel", "geometry_msgs/msg/Twist")
-    await client.advertise("/set_mode_cmd", "std_msgs/msg/String")
-
-    # Set mode to move (matches your example script)
-    current_mode = await client.get_current_mode()
-    print("Robot current mode:", current_mode)
-    print("Setting robot mode to 'move' ...")
-    await client.set_mode("move")
-    await asyncio.sleep(1.0)
-
-    # 3) Init Kinect system
+    # Kinect system
     ksys = KinectGridSystem(plane_smooth_alpha=0.15)
     display_w = int(ksys.color_w * DISPLAY_SCALE)
     display_h = int(ksys.color_h * DISPLAY_SCALE)
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
 
-    # 4) Tracker + Navigator + Controller
+    # Tracker + nav + controller
     tracker = ArucoRobotTrackerAuto(
         kinect_sys=ksys,
         strictness=ARUCO_STRICTNESS,
@@ -165,15 +149,15 @@ async def run() -> int:
 
     nav = GridNavigator(
         NavConfig(
-            command_interval_s=0.25,   # still prints status at this interval (optional)
+            command_interval_s=0.25,  # only affects prints in your nav logic
             pos_tolerance_m=POS_TOL_M,
             turn_start_deg=30.0,
             turn_stop_deg=12.0,
         )
     )
+
     ctrl = CmdVelController(CmdVelGains())
 
-    # Clicked grid center
     clicked_color_xy: Optional[Tuple[float, float]] = None
     status_msg = "1) Wait for plane lock, 2) Left-click taped grid center."
 
@@ -181,7 +165,7 @@ async def run() -> int:
         nonlocal clicked_color_xy, status_msg
         if event == cv2.EVENT_LBUTTONDOWN:
             cx = float(np.clip(x / DISPLAY_SCALE, 0, ksys.color_w - 1))
-            cy = float(np.clip(y / DISPLAY_SCALE, 0, ksys.color_h - 1))
+            cy = float(np.clip(y / DISPLAY_SCALE, 0, ksys.color_w - 1))
             clicked_color_xy = (cx, cy)
             status_msg = f"Clicked grid center at ({cx:.1f}, {cy:.1f}). Setting origin..."
         if event == cv2.EVENT_RBUTTONDOWN:
@@ -195,15 +179,14 @@ async def run() -> int:
     paused = False
     frame_idx = 0
 
-    # Control loop timing
-    dt = 1.0 / CONTROL_HZ
-    next_control_time = time.monotonic()
+    # cmd_vel control tick
+    dt = 1.0 / max(1e-6, CONTROL_HZ)
+    next_control = time.monotonic()
 
     try:
         while True:
-            # --- Kinect update ---
             if not ksys.update_frames():
-                await asyncio.sleep(0.002)
+                time.sleep(0.002)
                 continue
 
             ksys.try_update_plane(
@@ -219,7 +202,7 @@ async def run() -> int:
 
             bgra = ksys.get_color_bgr()
             if bgra is None:
-                await asyncio.sleep(0.002)
+                time.sleep(0.002)
                 continue
             bgr = bgra_to_bgr(bgra)
 
@@ -233,12 +216,10 @@ async def run() -> int:
 
             draw_grid_points(bgr, ksys, GRID_SPACING_M)
 
-            # --- Tracking ---
             robot: Optional[RobotPose2D] = tracker.detect_and_estimate(bgr)
             tracker.draw_debug(bgr)
             robot_uv = draw_robot(bgr, robot, ksys) if robot is not None else None
 
-            # --- Targets init ---
             if (not targets_initialized) and (ksys.grid_frame is not None):
                 targets = nav.make_targets_3x3_ordered_like_image(
                     frame=ksys.grid_frame,
@@ -247,7 +228,7 @@ async def run() -> int:
                 )
                 nav.set_targets(targets)
                 targets_initialized = True
-                status_msg = "Targets set. Robot driving. Press 'n' after placing stilt (or when safe)."
+                status_msg = "Targets set. Robot driving. SPACE = emergency stop."
 
             goal_xy = nav.current_target() if targets_initialized else None
             goal_uv = None
@@ -256,30 +237,27 @@ async def run() -> int:
                 if goal_uv is not None and robot_uv is not None:
                     cv2.line(bgr, robot_uv, goal_uv, LINE_COLOR, 2, cv2.LINE_AA)
 
-            # --- Control tick (send cmd_vel) ---
+            # Compute/send cmd_vel at fixed rate
             now = time.monotonic()
-            if now >= next_control_time:
-                next_control_time = now + dt
+            if now >= next_control:
+                next_control = now + dt
 
                 if paused or (not targets_initialized) or (ksys.grid_frame is None):
-                    await client.send_cmd_vel(0.0, 0.0)
+                    commander.stop_robot()
                     ctrl.reset()
                 else:
                     out = ctrl.compute(robot, goal_xy, pos_tol_m=POS_TOL_M)
-
-                    # If reached: stop and wait for 'n' like before (safe)
                     if out.reached:
-                        await client.send_cmd_vel(0.0, 0.0)
-                        nav._waiting_for_stilt = True  # keep existing workflow
+                        commander.stop_robot()
+                        # keep your safety workflow: stop and wait for manual 'n'
+                        nav._waiting_for_stilt = True
                     else:
-                        await client.send_cmd_vel(out.linear_x, out.angular_z)
+                        commander.send_cmd_vel(out.linear_x, out.angular_z)
 
-                    # Optional: print status
-                    # print(out.status)
-
-            # --- HUD ---
+            # HUD
             hud = [
-                f"RobotID: {ROBOT_ARUCO_ID}  Strictness: {ARUCO_STRICTNESS:.2f}  CtrlHz: {CONTROL_HZ:.1f}",
+                f"ROS: {'CONNECTED' if commander.is_connected() else 'DISCONNECTED'}  send_hz={CONTROL_HZ:.1f}",
+                f"RobotID: {ROBOT_ARUCO_ID}  Strictness: {ARUCO_STRICTNESS:.2f}",
                 f"Depth: {'OK' if ksys.last_depth_1d is not None else '---'}  Plane: {'LOCKED' if ksys.plane_locked else 'CALIBRATING'}  Fits: {ksys.fit_count}/{FITS_TO_LOCK}",
                 f"Grid origin: {'SET' if ksys.grid_frame is not None else 'NOT SET'}  Robot: {'OK' if robot is not None else '---'}",
                 f"Aruco: last_dict={tracker.last_dict_used} ids={tracker.last_detected_ids} perim={tracker.last_perimeter_px:.0f}px",
@@ -297,18 +275,20 @@ async def run() -> int:
             if key in (27, ord("q")):
                 break
             if key == ord("r"):
+                paused = True
+                commander.stop_robot()
+                ctrl.reset()
+
                 ksys.recalibrate_plane()
                 ksys.grid_frame = None
                 clicked_color_xy = None
                 targets_initialized = False
                 status_msg = "Recalibrating plane. After lock, click taped grid center again."
-                await client.send_cmd_vel(0.0, 0.0)
-                ctrl.reset()
             if key == ord("p"):
                 paused = not paused
                 status_msg = "Paused." if paused else "Resumed."
                 if paused:
-                    await client.send_cmd_vel(0.0, 0.0)
+                    commander.stop_robot()
                     ctrl.reset()
             if key == ord("n"):
                 nav.confirm_stilt_and_advance()
@@ -317,28 +297,30 @@ async def run() -> int:
             if key == 32:  # SPACE
                 paused = True
                 status_msg = "EMERGENCY STOP (paused). Press 'p' to resume."
-                await client.send_cmd_vel(0.0, 0.0)
+                commander.stop_robot()
                 ctrl.reset()
 
             frame_idx += 1
-            await asyncio.sleep(0.001)
+            time.sleep(0.001)
 
     finally:
-        # Always stop robot and set safe mode
+        # Always stop robot and request stand
         try:
-            await client.stop()
-            await client.set_mode("stand")
+            commander.stop_robot()
+            commander.set_mode("stand")
+            time.sleep(0.2)
         except Exception:
             pass
+        commander.shutdown()
+
         try:
             ksys.close()
         except Exception:
             pass
         cv2.destroyAllWindows()
-        await client.close()
 
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(asyncio.run(run()))
+    raise SystemExit(main())

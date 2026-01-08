@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
+import time
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Optional, Tuple
 
 import websockets
 
@@ -11,93 +13,200 @@ import websockets
 @dataclass
 class RosbridgeConfig:
     url: str
+    cmd_vel_topic: str = "/cmd_vel"
+    mode_topic: str = "/set_mode_cmd"
+
+    # How often we send cmd_vel (Hz)
+    send_hz: float = 10.0
+
+    # Websocket keepalive
+    ping_interval_s: float = 10.0
+    ping_timeout_s: float = 10.0
+
+    # Reconnect behavior
+    reconnect_backoff_s: float = 2.0
     connect_timeout_s: float = 10.0
-    recv_timeout_s: float = 2.0
-    ping_interval_s: float = 20.0
-    ping_timeout_s: float = 20.0
+
+    # Debug prints
+    verbose: bool = True
 
 
-class OloRosbridgeClient:
+class RosbridgeCommander:
     """
-    Minimal rosbridge websocket client:
-      - advertise(topic, type)
-      - publish(topic, msg)
-      - subscribe_once(topic, type, timeout)  (useful for /current_mode)
-      - set_mode(mode) helper
-      - stop() helper (publish zero cmd_vel)
+    Runs rosbridge websocket in a dedicated thread (so OpenCV/Kinect can't block it).
+
+    Public (thread-safe) methods:
+      - start()
+      - send_cmd_vel(linear_x, angular_z)
+      - stop_robot()
+      - set_mode(mode)
+      - is_connected()
+      - shutdown()
     """
 
     def __init__(self, cfg: RosbridgeConfig) -> None:
         self.cfg = cfg
-        self._ws: Optional[websockets.WebSocketClientProtocol] = None
 
-    async def connect(self) -> None:
-        self._ws = await asyncio.wait_for(
-            websockets.connect(
-                self.cfg.url,
-                ping_interval=self.cfg.ping_interval_s,
-                ping_timeout=self.cfg.ping_timeout_s,
-                max_queue=32,
-            ),
-            timeout=self.cfg.connect_timeout_s,
-        )
+        self._thread: Optional[threading.Thread] = None
+        self._stop_evt = threading.Event()
 
-    async def close(self) -> None:
-        if self._ws is not None:
-            await self._ws.close()
-            self._ws = None
+        # Latest command buffer (protected by lock)
+        self._lock = threading.Lock()
+        self._latest_cmd: Tuple[float, float] = (0.0, 0.0)  # (linear_x, angular_z)
+        self._latest_mode: Optional[str] = None
 
-    def _require_ws(self) -> websockets.WebSocketClientProtocol:
-        if self._ws is None:
-            raise RuntimeError("Not connected to rosbridge websocket.")
-        return self._ws
+        # Connection state
+        self._connected = False
+        self._connected_lock = threading.Lock()
 
-    async def send_raw(self, payload: dict[str, Any]) -> None:
-        ws = self._require_ws()
-        await ws.send(json.dumps(payload))
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._thread_main, name="rosbridge-commander", daemon=True)
+        self._thread.start()
 
-    async def recv_raw(self, timeout_s: Optional[float] = None) -> dict[str, Any]:
-        ws = self._require_ws()
-        t = self.cfg.recv_timeout_s if timeout_s is None else timeout_s
-        data = await asyncio.wait_for(ws.recv(), timeout=t)
-        return json.loads(data)
+    def is_connected(self) -> bool:
+        with self._connected_lock:
+            return self._connected
 
-    async def advertise(self, topic: str, msg_type: str) -> None:
-        await self.send_raw({"op": "advertise", "topic": topic, "type": msg_type})
+    def _set_connected(self, v: bool) -> None:
+        with self._connected_lock:
+            self._connected = v
 
-    async def publish(self, topic: str, msg: dict[str, Any]) -> None:
-        await self.send_raw({"op": "publish", "topic": topic, "msg": msg})
+    def send_cmd_vel(self, linear_x: float, angular_z: float) -> None:
+        with self._lock:
+            self._latest_cmd = (float(linear_x), float(angular_z))
 
-    async def subscribe_once(self, topic: str, msg_type: str, timeout_s: float = 2.0) -> Optional[dict[str, Any]]:
+    def stop_robot(self) -> None:
+        self.send_cmd_vel(0.0, 0.0)
+
+    def set_mode(self, mode: str) -> None:
+        with self._lock:
+            self._latest_mode = str(mode)
+
+    def shutdown(self) -> None:
+        self._stop_evt.set()
+        # ensure we request a stop immediately
+        self.stop_robot()
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+            self._thread = None
+
+    # -------------------- Thread / asyncio side --------------------
+
+    def _thread_main(self) -> None:
+        asyncio.run(self._run_async())
+
+    async def _run_async(self) -> None:
         """
-        Subscribe and wait for ONE message on that topic.
+        Reconnect loop. Never crashes the main program.
         """
-        await self.send_raw({"op": "subscribe", "topic": topic, "type": msg_type})
-        try:
-            while True:
-                packet = await self.recv_raw(timeout_s=timeout_s)
-                if packet.get("topic") == topic:
-                    return packet.get("msg", None)
-        except asyncio.TimeoutError:
-            return None
+        backoff = self.cfg.reconnect_backoff_s
 
-    async def set_mode(self, mode: str) -> None:
-        await self.publish("/set_mode_cmd", {"data": mode})
+        while not self._stop_evt.is_set():
+            try:
+                await self._connect_and_loop()
+            except Exception as e:
+                self._set_connected(False)
+                if self.cfg.verbose:
+                    print(f"[rosbridge] connection error: {e!r}")
+                # small backoff before reconnect
+                await asyncio.sleep(backoff)
 
-    async def get_current_mode(self) -> str:
-        msg = await self.subscribe_once("/current_mode", "std_msgs/msg/String", timeout_s=2.0)
-        if msg is None:
-            return "unknown"
-        return str(msg.get("data", "unknown"))
+    async def _connect_and_loop(self) -> None:
+        if self.cfg.verbose:
+            print("[rosbridge] connecting...")
 
-    async def send_cmd_vel(self, linear_x: float, angular_z: float) -> None:
-        await self.publish(
-            "/cmd_vel",
-            {
-                "linear": {"x": float(linear_x), "y": 0.0, "z": 0.0},
-                "angular": {"x": 0.0, "y": 0.0, "z": float(angular_z)},
-            },
-        )
+        # Use async context manager like your example script :contentReference[oaicite:1]{index=1}
+        async with websockets.connect(
+            self.cfg.url,
+            ping_interval=self.cfg.ping_interval_s,
+            ping_timeout=self.cfg.ping_timeout_s,
+            open_timeout=self.cfg.connect_timeout_s,
+            close_timeout=2.0,
+            max_queue=32,
+        ) as ws:
+            self._set_connected(True)
+            if self.cfg.verbose:
+                print("[rosbridge] connected ✅")
 
-    async def stop(self) -> None:
-        await self.send_cmd_vel(0.0, 0.0)
+            # Advertise topics (same types as example script) :contentReference[oaicite:2]{index=2}
+            await ws.send(json.dumps({
+                "op": "advertise",
+                "topic": self.cfg.cmd_vel_topic,
+                "type": "geometry_msgs/msg/Twist",
+            }))
+            await ws.send(json.dumps({
+                "op": "advertise",
+                "topic": self.cfg.mode_topic,
+                "type": "std_msgs/msg/String",
+            }))
+
+            # If caller already requested a mode, send it once after connect.
+            mode = None
+            with self._lock:
+                mode = self._latest_mode
+            if mode:
+                await ws.send(json.dumps({
+                    "op": "publish",
+                    "topic": self.cfg.mode_topic,
+                    "msg": {"data": mode},
+                }))
+                if self.cfg.verbose:
+                    print(f"[rosbridge] set_mode -> {mode}")
+
+            # Main send loop
+            period = 1.0 / max(1e-6, float(self.cfg.send_hz))
+            next_t = time.monotonic()
+
+            # We re-send cmd_vel continuously (robot expects a stream)
+            while not self._stop_evt.is_set():
+                now = time.monotonic()
+                if now < next_t:
+                    await asyncio.sleep(min(0.02, next_t - now))
+                    continue
+                next_t += period
+
+                # Send mode if updated
+                mode_to_send = None
+                with self._lock:
+                    if self._latest_mode is not None:
+                        mode_to_send = self._latest_mode
+                        self._latest_mode = None
+
+                if mode_to_send is not None:
+                    await ws.send(json.dumps({
+                        "op": "publish",
+                        "topic": self.cfg.mode_topic,
+                        "msg": {"data": mode_to_send},
+                    }))
+                    if self.cfg.verbose:
+                        print(f"[rosbridge] set_mode -> {mode_to_send}")
+
+                # Send cmd_vel
+                with self._lock:
+                    lin, ang = self._latest_cmd
+
+                msg = {
+                    "op": "publish",
+                    "topic": self.cfg.cmd_vel_topic,
+                    "msg": {
+                        "linear": {"x": float(lin), "y": 0.0, "z": 0.0},
+                        "angular": {"x": 0.0, "y": 0.0, "z": float(ang)},
+                    },
+                }
+                await ws.send(json.dumps(msg))
+
+            # Before exiting connection, stop robot once
+            try:
+                await ws.send(json.dumps({
+                    "op": "publish",
+                    "topic": self.cfg.cmd_vel_topic,
+                    "msg": {"linear": {"x": 0.0, "y": 0.0, "z": 0.0}, "angular": {"x": 0.0, "y": 0.0, "z": 0.0}},
+                }))
+            except Exception:
+                pass
+
+        self._set_connected(False)
+        if self.cfg.verbose:
+            print("[rosbridge] disconnected")
