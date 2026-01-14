@@ -16,7 +16,7 @@ from grid_core import (
 )
 from robot_tracker import ArucoRobotTrackerAuto, RobotPose2D
 from cmd_vel_controller import TwoStageCmdVelController, TwoStageGains
-from olo_rosbridge import RosbridgeCommander, RosbridgeConfig
+from lite3_udp_commander import Lite3UdpCommander, Lite3UdpConfig
 
 
 # ---------------- Window / Display ----------------
@@ -47,6 +47,8 @@ ROI_X_FRAC = (0.10, 0.90)
 ROI_Y_FRAC = (0.20, 0.95)
 
 # ---------------- Control ----------------
+# NOTE: axis commands to the Lite3 are streamed by Lite3UdpCommander at 50 Hz.
+# This CONTROL_HZ is only how often we update the *desired* velocities and mission state.
 CONTROL_HZ = 10.0
 PAUSE_AT_HOME_S = 1.5     # simulate picking stilt
 PAUSE_AT_TARGET_S = 1.5   # simulate placing stilt
@@ -185,23 +187,34 @@ def make_targets_row_by_row_like_image() -> List[Tuple[float, float]]:
 
 
 def main() -> int:
-    ws_url = os.environ.get("OLO_ROSBRIDGE_URL", "").strip()
-    if not ws_url:
-        print("ERROR: Please set OLO_ROSBRIDGE_URL to your wss://... rosbridge URL.")
-        return 1
+    # --- Robot UDP config ---
+    # Keep these as environment variables so you don't hardcode lab details.
+    robot_ip = os.environ.get("LITE3_ROBOT_IP", "192.168.1.120").strip()
+    robot_port = int(os.environ.get("LITE3_ROBOT_PORT", "43893").strip())
+    local_port = int(os.environ.get("LITE3_LOCAL_PORT", "12345").strip())
 
-    commander = RosbridgeCommander(
-        RosbridgeConfig(
-            url=ws_url,
-            send_hz=10.0,
+    # IMPORTANT: We intentionally do NOT auto-toggle stand/sit.
+    # The vendor command 0x21010202 is often a toggle; auto-sending it can do the wrong thing
+    # depending on the robot's current state.
+    #
+    # Before starting this script, make sure the robot is safely standing.
+    # Then we switch to MOVE mode (safe, idempotent in practice).
+
+    commander = Lite3UdpCommander(
+        Lite3UdpConfig(
+            robot_ip=robot_ip,
+            robot_port=robot_port,
+            local_port=local_port,
+            send_hz=50.0,
             verbose=True,
-            ping_interval_s=20.0,
-            ping_timeout_s=20.0,
-            debug_print_period_s=2.0,
+            # These are chosen to match the cmd_vel controller's max values.
+            # If you want the robot to respond more gently, LOWER these scale numbers.
+            lin_full_scale_mps=0.28,
+            yaw_full_scale_rps=0.85,
         )
     )
     commander.start()
-    commander.set_mode("move")
+    commander.set_motion_mode("move")
 
     # Kinect system
     ksys = KinectGridSystem(plane_smooth_alpha=0.15)
@@ -426,14 +439,14 @@ def main() -> int:
                         ctrl.reset()
 
             # --- HUD ---
-            mode_seen = commander.last_mode_seen()
             hud = [
-                f"ROS: {'CONNECTED' if commander.is_connected() else 'DISCONNECTED'}  mode={mode_seen}",
+                f"UDP: {'RUNNING' if commander.is_connected() else 'STOPPED'}  robot={robot_ip}:{robot_port}",
                 f"Mission: {mission.state}  target={mission.target_index+1 if mission.current_target() else '-'} / {len(mission.targets_xy) if mission.targets_xy else '-'}",
                 f"Home: {'SET' if mission.home_xy else 'NOT SET'}  GridOrigin: {'SET' if ksys.grid_frame else 'NOT SET'}",
                 f"Robot871: {'OK' if robot else '---'}  strict={ARUCO_STRICTNESS:.2f}  heading_offset={HEADING_OFFSET_DEG:.0f}deg",
                 f"Plane: {'LOCKED' if ksys.plane_locked else 'CALIBRATING'}  Fits: {ksys.fit_count}/{FITS_TO_LOCK}",
                 "Keys: q/ESC quit, p toggle pause, SPACE stop, r recalibrate, h set HOME at robot position",
+                "Robot keys: m -> MOVE mode, o -> POSE mode, t -> stand/sit toggle (use carefully)",
             ]
             if status_msg:
                 hud.insert(0, status_msg)
@@ -498,13 +511,27 @@ def main() -> int:
                 else:
                     status_msg = "Cannot set HOME: robot 871 not visible."
 
+            # --- robot mode helpers ---
+            if key == ord("m"):
+                commander.set_motion_mode("move")
+                status_msg = "Robot: MOVE mode requested."
+
+            if key == ord("o"):
+                commander.set_motion_mode("pose")
+                status_msg = "Robot: POSE mode requested."
+
+            if key == ord("t"):
+                # WARNING: This is often a toggle. Use only if you know the current posture.
+                commander.stand_sit_toggle()
+                status_msg = "Robot: stand/sit TOGGLE sent (use carefully)."
+
             frame_idx += 1
             time.sleep(0.001)
 
     finally:
         try:
             commander.stop_robot()
-            commander.set_mode("stand")
+            commander.set_motion_mode("pose")
             time.sleep(0.2)
         except Exception:
             pass
