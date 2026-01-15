@@ -189,7 +189,7 @@ def make_targets_row_by_row_like_image() -> List[Tuple[float, float]]:
 def main() -> int:
     # --- Robot UDP config ---
     # Keep these as environment variables so you don't hardcode lab details.
-    robot_ip = os.environ.get("LITE3_ROBOT_IP", "192.168.1.120").strip()
+    robot_ip = os.environ.get("LITE3_ROBOT_IP", "192.168.2.1").strip()
     robot_port = int(os.environ.get("LITE3_ROBOT_PORT", "43893").strip())
     local_port = int(os.environ.get("LITE3_LOCAL_PORT", "12345").strip())
 
