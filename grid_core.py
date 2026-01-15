@@ -60,7 +60,7 @@ class PlaneSmoother:
             self._d = d
             return Plane(self._n, self._d)
 
-        # keep direction consistent
+        # keep direction consistent relative to previous estimate
         if float(np.dot(self._n, n)) < 0.0:
             n = -n
             d = -d
@@ -73,14 +73,38 @@ class PlaneSmoother:
 def build_plane_basis(n: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """
     Build two orthonormal vectors e1,e2 that lie on the plane.
-    e1 = camera +X projected into plane; e2 = n x e1.
+
+    Deterministic rules (important for stable X/Y across recalibration):
+      1) Force the plane normal to have a consistent sign:
+         - We choose n such that n.z < 0 (i.e., points toward the camera).
+         - This prevents the basis from flipping when the plane normal flips.
+      2) e1 (+X) = projection of camera +X onto plane, and we force it to point
+         to the same "camera-right" direction (dot(e1, camera_x) > 0).
+      3) e2 (+Y) = n x e1 (right-handed).
     """
-    x_axis = np.array([1.0, 0.0, 0.0], dtype=np.float64)
-    e1 = x_axis - float(np.dot(x_axis, n)) * n
+    n = normalize(n.astype(np.float64))
+
+    # Force deterministic sign of the normal (toward camera).
+    # Kinect camera +Z points away from camera; we choose normal with negative Z.
+    if n[2] > 0.0:
+        n = -n
+
+    cam_x = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+
+    # Project camera +X onto the plane
+    e1 = cam_x - float(np.dot(cam_x, n)) * n
     e1 = normalize(e1)
+
+    # If camera +X is nearly parallel to the normal (rare), fall back to camera +Y.
     if float(np.linalg.norm(e1)) < 1e-6:
-        z_axis = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-        e1 = normalize(z_axis - float(np.dot(z_axis, n)) * n)
+        cam_y = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+        e1 = normalize(cam_y - float(np.dot(cam_y, n)) * n)
+
+    # Force e1 to point consistently to camera-right
+    if float(np.dot(e1, cam_x)) < 0.0:
+        e1 = -e1
+
+    # e2 completes a right-handed basis
     e2 = normalize(np.cross(n, e1))
     return e1, e2
 
@@ -89,7 +113,6 @@ def project_point_to_plane(p: np.ndarray, plane: Plane) -> np.ndarray:
     """
     Orthogonal projection of a 3D point onto the plane along the plane normal.
     """
-    # signed distance: n·p + d
     dist = float(np.dot(plane.n, p) + plane.d)
     return p - dist * plane.n
 
@@ -146,7 +169,13 @@ def depth_pixel_to_camera_point(kinect, u: int, v: int, depth_mm: int) -> Option
         return None
 
 
-def map_depth_pixel_to_color_xy(kinect, depth_frame_1d: np.ndarray, depth_w: int, u: int, v: int) -> Optional[Tuple[float, float]]:
+def map_depth_pixel_to_color_xy(
+    kinect,
+    depth_frame_1d: np.ndarray,
+    depth_w: int,
+    u: int,
+    v: int
+) -> Optional[Tuple[float, float]]:
     """
     Map a single depth pixel (u,v) to a color pixel using its measured depth.
     This is used to invert color->depth by searching.
@@ -183,8 +212,7 @@ def find_depth_pixel_for_color_xy(
 ) -> Optional[Tuple[int, int]]:
     """
     Find the depth pixel whose projection into the color image is closest to (target_color_xy).
-
-    We do a coarse-to-fine search to keep it fast.
+    Coarse-to-fine search for speed.
     """
     tx, ty = float(target_color_xy[0]), float(target_color_xy[1])
 
@@ -444,7 +472,6 @@ class KinectGridSystem:
         if self.plane is None or self.last_depth_1d is None:
             return False
 
-        # Find the depth pixel that corresponds to this color pixel
         depth_uv = find_depth_pixel_for_color_xy(
             self.kinect,
             self.last_depth_1d,
@@ -464,20 +491,19 @@ class KinectGridSystem:
         if p_cam is None:
             return False
 
-        # clicked tape is on floor; still project to plane for robustness
+        # clicked tape is on floor; project to plane for robustness
         p_floor = project_point_to_plane(p_cam, self.plane)
 
+        # Deterministic basis here:
         e1, e2 = build_plane_basis(self.plane.n)
         self.grid_frame = GridFrame(plane=self.plane, origin_cam=p_floor, e1=e1, e2=e2)
         return True
 
     def get_color_bgr(self) -> Optional[np.ndarray]:
         """
-        Convert last color frame to BGR image.
+        Convert last color frame to BGRA image (main script converts to BGR).
         """
         if self.last_color_1d is None:
             return None
         bgra = self.last_color_1d.reshape((self.color_h, self.color_w, 4)).astype(np.uint8, copy=False)
-        # Avoid importing cv2 here to keep module dependency light; main_nav handles conversion.
-        # But we still return BGRA for main_nav to convert.
         return bgra
