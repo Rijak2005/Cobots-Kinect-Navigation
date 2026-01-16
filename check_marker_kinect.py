@@ -7,10 +7,15 @@ CANDIDATE_DICTS = [
     "DICT_4X4_50",
     "DICT_4X4_100",
     "DICT_5X5_50",
+    "DICT_5X5_100",
+    "DICT_6X6_100",
+    "DICT_6X6_250",
+    "DICT_7X7_50",
+    "DICT_7X7_100",
     "DICT_ARUCO_ORIGINAL",
 ]
 ALLOWED_IDS: set[int] | None = None  # e.g., {0, 1, 2}; None = any
-MIN_MARKER_SIZE_PX = 40
+MIN_MARKER_SIZE_PX = 10
 DEBOUNCE_SEC = 0.5
 DISPLAY_SCALE = 0.75  # for the shown window; keep full-res for detection
 
@@ -58,11 +63,18 @@ def color_frame_to_bgr(frame_1d: np.ndarray, width: int, height: int) -> np.ndar
     bgra = frame_1d.reshape((height, width, 4)).astype(np.uint8, copy=False)
     return cv2.cvtColor(bgra, cv2.COLOR_BGRA2BGR)
 
+def preprocess_gray(gray: np.ndarray) -> np.ndarray:
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    return clahe.apply(gray)
+
 def main() -> None:
     if not hasattr(cv2, "aruco"):
         raise RuntimeError("cv2.aruco not found. Install: pip install opencv-contrib-python")
 
-    detectors = {name: build_detector(name) for name in CANDIDATE_DICTS}
+    detectors = {}
+    for name in CANDIDATE_DICTS:
+        if hasattr(cv2.aruco, name):
+            detectors[name] = build_detector(name)
 
     kinect = PyKinectRuntime.PyKinectRuntime(PyKinect2024.FrameSourceTypes_Color)
     color_w = kinect.color_frame_desc.Width
@@ -83,6 +95,7 @@ def main() -> None:
 
             frame_bgr = color_frame_to_bgr(color_1d, color_w, color_h)
             gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+            gray = preprocess_gray(gray)
 
             dict_name, ids, corners = detect_first_hit(detectors, gray)
 
