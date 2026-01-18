@@ -30,7 +30,7 @@ def world_to_body(vx_w: float, vy_w: float, heading_rad: float) -> tuple[float, 
     heading_rad: robot heading in WORLD; 0 means robot faces +WORLD_X
     BODY:
       +x forward
-      +y right (your statement: +axis_y moves robot to the right)
+      +y right (positive axis_y moves robot to the right)
     """
     c = math.cos(heading_rad)
     s = math.sin(heading_rad)
@@ -42,27 +42,25 @@ def world_to_body(vx_w: float, vy_w: float, heading_rad: float) -> tuple[float, 
 @dataclass
 class AxisGains:
     # ======== USER KNOBS ========
-    # Forward/back must be > 6553
     axis_fwd_fast: int = 9000
-    axis_fwd_near: int = 7000  # minimal slow speed (just above deadzone)
-
-    # Lateral must be > 12553
+    axis_fwd_near: int = 7000  # just above deadzone
     axis_lat_mag: int = 16000
 
-    # Yaw must be > 9553 (used only at approach)
-    axis_yaw_mag: int = 11000
+    # yaw magnitudes (micro yaw used at target approach)
+    axis_yaw_mag: int = 9600
+    axis_yaw_mag_target: int = 9600
     # ============================
 
     # tolerances
     axis_tol_m: float = 0.03
     arrive_radius_m: float = 0.07
-    stable_reach_ticks: int = 4  # a bit stricter to reduce overshoot "bounce"
+    stable_reach_ticks: int = 4
 
     # slow down zones (meters)
     slow_y_m: float = 0.25
     slow_x_m: float = 0.25
 
-    # heading alignment at approach
+    # heading alignment
     turn_tol_deg: float = 8.0
 
     # latch turn direction to avoid oscillation
@@ -70,6 +68,11 @@ class AxisGains:
 
     # bump above deadzone if needed
     bump_over_deadzone: bool = True
+
+    # target yaw behavior
+    target_yaw_start_deg: float = 15.0
+    yaw_pulse_period: int = 3
+    yaw_pulse_on: int = 1
 
 
 @dataclass
@@ -84,13 +87,11 @@ class AxisOut:
 
 class AxisStepController:
     """
-    Travel to approach with translation only (NO yaw):
-      - reduce WORLD Y error first, then WORLD X error
-      - BUT: command is converted into body (ax, ay) using heading,
-        so it still works even if robot isn't perfectly facing +X.
-
-    lat_sign:
-      - If your grid Y is flipped, set lat_sign = -1 (you confirmed this works).
+    Translation-first controller:
+      - move_to_point_y_then_x: translation only (NO yaw)
+      - turn_to_face_small: micro-yaw (pulsed) with skip threshold (used at TARGET approach)
+      - forward_to_point: final forward/back based on world dx (used at TARGET final)
+      - backward_to_point: reverse slowly (used to back out from target to approach)
     """
 
     def __init__(self, g: AxisGains) -> None:
@@ -100,9 +101,12 @@ class AxisStepController:
     def reset(self) -> None:
         self._reach_streak = 0
         self._last_goal: Optional[Tuple[float, float]] = None
-        self._phase_axis = "Y"  # "Y" then "X"
+        self._phase_axis = "Y"
         self._turn_dir: Optional[int] = None
-        self._lat_sign: int = -1  # IMPORTANT: default to what you verified works
+        self._lat_sign: int = -1
+
+        self._yaw_tick: int = 0
+        self._yaw_target_lock: Optional[Tuple[float, float]] = None
 
     def set_lateral_sign(self, lat_sign: int) -> None:
         self._lat_sign = +1 if lat_sign >= 0 else -1
@@ -137,17 +141,13 @@ class AxisStepController:
         return v
 
     def _pick_fwd_mag(self, err_m: float, slow_m: float) -> int:
-        """
-        Two-speed profile:
-          far: axis_fwd_fast
-          near: axis_fwd_near
-        """
         return self.g.axis_fwd_near if abs(err_m) < slow_m else self.g.axis_fwd_fast
 
-    def _dir_world_to_axes(self, vx_w: float, vy_w: float, heading: float, fwd_mag: int, lat_mag: int) -> tuple[int, int]:
+    def _dir_world_to_axes(
+        self, vx_w: float, vy_w: float, heading: float, fwd_mag: int, lat_mag: int
+    ) -> tuple[int, int]:
         vx_b, vy_b = world_to_body(vx_w, vy_w, heading)
 
-        # normalize
         m = max(abs(vx_b), abs(vy_b))
         if m < 1e-9:
             return 0, 0
@@ -157,7 +157,6 @@ class AxisStepController:
         ax = int(round(nx * fwd_mag))
         ay = int(round(ny * lat_mag))
 
-        # apply lateral sign fix
         ay = int(self._lat_sign * ay)
 
         ax = clamp_axis(ax)
@@ -177,55 +176,82 @@ class AxisStepController:
         if self._reached(robot, goal):
             return AxisOut(0, 0, 0, True, "REACHED", "Reached (stable)")
 
-        # 1) WORLD Y
+        # WORLD Y first
         if self._phase_axis == "Y":
             if abs(ey) <= self.g.axis_tol_m:
                 self._phase_axis = "X"
             else:
                 vy_w = 1.0 if ey > 0 else -1.0
-
-                # Use NEAR speed when close in Y to prevent overshoot
                 fwd_mag = self._pick_fwd_mag(ey, self.g.slow_y_m)
-                ax, ay = self._dir_world_to_axes(0.0, vy_w, robot.heading, fwd_mag=fwd_mag, lat_mag=self.g.axis_lat_mag)
+                ax, ay = self._dir_world_to_axes(
+                    0.0, vy_w, robot.heading, fwd_mag=fwd_mag, lat_mag=self.g.axis_lat_mag
+                )
                 return AxisOut(ax, ay, 0, False, "MOVE_WY", f"Reduce world-Y ey={ey:+.3f}m fwd_mag={fwd_mag}")
 
-        # 2) WORLD X
+        # then WORLD X
         if abs(ex) > self.g.axis_tol_m:
             vx_w = 1.0 if ex > 0 else -1.0
-
-            # Use NEAR speed when close in X to prevent overshoot
             fwd_mag = self._pick_fwd_mag(ex, self.g.slow_x_m)
-            ax, ay = self._dir_world_to_axes(vx_w, 0.0, robot.heading, fwd_mag=fwd_mag, lat_mag=self.g.axis_lat_mag)
+            ax, ay = self._dir_world_to_axes(
+                vx_w, 0.0, robot.heading, fwd_mag=fwd_mag, lat_mag=self.g.axis_lat_mag
+            )
             return AxisOut(ax, ay, 0, False, "MOVE_WX", f"Reduce world-X ex={ex:+.3f}m fwd_mag={fwd_mag}")
 
         return AxisOut(0, 0, 0, False, "HOLD", "Inside axis tolerance, holding")
 
-    # -------- rotate slowly at approach only --------
-    def turn_to_face(self, robot: RobotPose2D, face_goal: Tuple[float, float]) -> AxisOut:
-        dx = face_goal[0] - robot.x
-        dy = face_goal[1] - robot.y
-        desired = math.atan2(dy, dx)
-        err = wrap_angle(desired - robot.heading)
-
+    # -------- yaw helpers (micro yaw) --------
+    def _yaw_cmd(self, err_rad: float, yaw_mag: int, pulse: bool) -> AxisOut:
         tol = math.radians(self.g.turn_tol_deg)
-        if abs(err) <= tol:
+        if abs(err_rad) <= tol:
             self._turn_dir = None
-            return AxisOut(0, 0, 0, True, "TURN_DONE", f"Facing OK err={math.degrees(err):+.1f}°")
+            return AxisOut(0, 0, 0, True, "TURN_DONE", f"Facing OK err={math.degrees(err_rad):+.1f}°")
 
         if self.g.latch_turn:
             if self._turn_dir is None:
-                self._turn_dir = +1 if err > 0 else -1
-            az = self.g.axis_yaw_mag * self._turn_dir
+                self._turn_dir = +1 if err_rad > 0 else -1
+            az = yaw_mag * self._turn_dir
         else:
-            az = self.g.axis_yaw_mag if err > 0 else -self.g.axis_yaw_mag
+            az = yaw_mag if err_rad > 0 else -yaw_mag
 
         az = clamp_axis(az)
         if abs(az) <= DZ_YAW:
             az = (DZ_YAW + 1) if az > 0 else -(DZ_YAW + 1)
 
-        return AxisOut(0, 0, az, False, "TURN", f"Turn to face err={math.degrees(err):+.1f}°")
+        if not pulse:
+            return AxisOut(0, 0, az, False, "TURN", f"Turn err={math.degrees(err_rad):+.1f}°")
 
-    # -------- final approach: forward only (no strafe, no yaw) --------
+        # pulsed yaw to reduce overshoot
+        self._yaw_tick += 1
+        period = max(1, int(self.g.yaw_pulse_period))
+        on = max(0, min(period, int(self.g.yaw_pulse_on)))
+        in_on_window = ((self._yaw_tick - 1) % period) < on
+        az_out = az if in_on_window else 0
+
+        return AxisOut(0, 0, az_out, False, "TURN_PULSE", f"Pulsed yaw err={math.degrees(err_rad):+.1f}° az={'ON' if in_on_window else 'OFF'}")
+
+    def turn_to_face_small(self, robot: RobotPose2D, face_goal: Tuple[float, float]) -> AxisOut:
+        """
+        For TARGET approach only:
+          - skip yaw if error is small
+          - otherwise pulsed micro-yaw
+        """
+        if self._yaw_target_lock != face_goal:
+            self._yaw_target_lock = face_goal
+            self._yaw_tick = 0
+            self._turn_dir = None
+
+        dx = face_goal[0] - robot.x
+        dy = face_goal[1] - robot.y
+        desired = math.atan2(dy, dx)
+        err = wrap_angle(desired - robot.heading)
+
+        if abs(err) < math.radians(self.g.target_yaw_start_deg):
+            self._turn_dir = None
+            return AxisOut(0, 0, 0, True, "TURN_SKIPPED", f"Skip small yaw err={math.degrees(err):+.1f}°")
+
+        return self._yaw_cmd(err, yaw_mag=int(self.g.axis_yaw_mag_target), pulse=True)
+
+    # -------- final approach (TARGET): forward/back only based on world dx --------
     def forward_to_point(self, robot: RobotPose2D, goal: Tuple[float, float]) -> AxisOut:
         if self._reached(robot, goal):
             return AxisOut(0, 0, 0, True, "REACHED", "Reached (stable)")
@@ -235,3 +261,17 @@ class AxisStepController:
         ax = mag if dx >= 0 else -mag
         ax = self._bump(clamp_axis(ax), DZ_X)
         return AxisOut(ax, 0, 0, False, "FINAL_FWD", f"Forward only mag={mag}")
+
+    # -------- reverse: back out slowly --------
+    def backward_to_point(self, robot: RobotPose2D, goal: Tuple[float, float]) -> AxisOut:
+        if self._reached(robot, goal):
+            return AxisOut(0, 0, 0, True, "REACHED", "Reached (stable)")
+
+        mag = int(self.g.axis_fwd_near)
+        ax = -mag
+        ax = self._bump(clamp_axis(ax), DZ_X)
+
+        dx = goal[0] - robot.x
+        dy = goal[1] - robot.y
+        dist = math.hypot(dx, dy)
+        return AxisOut(ax, 0, 0, False, "BACK", f"Backward only mag={mag} dist={dist:.2f}m")

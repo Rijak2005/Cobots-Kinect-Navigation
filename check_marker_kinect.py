@@ -4,20 +4,12 @@ import numpy as np
 from pykinect2024 import PyKinectRuntime, PyKinect2024
 
 CANDIDATE_DICTS = [
-    "DICT_4X4_50",
-    "DICT_4X4_100",
-    "DICT_5X5_50",
-    "DICT_5X5_100",
-    "DICT_6X6_100",
-    "DICT_6X6_250",
-    "DICT_7X7_50",
-    "DICT_7X7_100",
-    "DICT_ARUCO_ORIGINAL",
+    "DICT_4X4_1000",
 ]
-ALLOWED_IDS: set[int] | None = None  # e.g., {0, 1, 2}; None = any
+ALLOWED_IDS: set[int] | None = {871, 0}
 MIN_MARKER_SIZE_PX = 10
 DEBOUNCE_SEC = 0.5
-DISPLAY_SCALE = 0.75  # for the shown window; keep full-res for detection
+DISPLAY_SCALE = 0.6  # for the shown window; keep full-res for detection
 
 def build_detector(dict_name: str) -> cv2.aruco.ArucoDetector:
     d = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, dict_name))
@@ -64,8 +56,8 @@ def color_frame_to_bgr(frame_1d: np.ndarray, width: int, height: int) -> np.ndar
     return cv2.cvtColor(bgra, cv2.COLOR_BGRA2BGR)
 
 def preprocess_gray(gray: np.ndarray) -> np.ndarray:
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    return clahe.apply(gray)
+    # lightweight preprocessing for speed; keep as-is if quality is fine
+    return gray
 
 def main() -> None:
     if not hasattr(cv2, "aruco"):
@@ -75,6 +67,9 @@ def main() -> None:
     for name in CANDIDATE_DICTS:
         if hasattr(cv2.aruco, name):
             detectors[name] = build_detector(name)
+
+    if not detectors:
+        raise RuntimeError("No valid ArUco dictionaries available (expected DICT_4X4_1000).")
 
     kinect = PyKinectRuntime.PyKinectRuntime(PyKinect2024.FrameSourceTypes_Color)
     color_w = kinect.color_frame_desc.Width

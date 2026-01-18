@@ -16,15 +16,19 @@ from lite3_udp_commander import Lite3UdpCommander, Lite3UdpConfig
 
 
 WINDOW_NAME = "Kinect v2 - Robot Mission (HOME <-> GRID)"
-DISPLAY_SCALE = 0.65
+DISPLAY_SCALE = 0.7
 
-ARUCO_STRICTNESS = 0.30
+ARUCO_STRICTNESS = 0.10
 ROBOT_ARUCO_ID = 871
+ROBOT_ALT_IDS = [0]  # <-- NEW: accept flipped decode as well
 PREFERRED_ARUCO_DICT = "DICT_4X4_1000"
 HEADING_OFFSET_DEG = 0.0
-MIN_MARKER_SIZE_PX = 40.0
+MIN_MARKER_SIZE_PX = 20.0  # a bit lower than before; safer for far frames
 
 GRID_SPACING_M = 0.60
+
+# Target approach is BEFORE target in +X direction (tx - A)
+# Home approach is AFTER home in +X direction (hx + A)
 APPROACH_BEFORE_X_M = 0.30
 
 FIT_EVERY_N_FRAMES = 10
@@ -37,31 +41,40 @@ ROI_Y_FRAC = (0.20, 0.95)
 
 CONTROL_HZ = 12.0
 PAUSE_AT_HOME_S = 1.0
-PAUSE_AT_TARGET_S = 1.0
+PAUSE_AT_TARGET_S = 2.5
 
 LOST_TIMEOUT_S = 0.80
 
-# IMPORTANT: You confirmed -1 works in your setup
+# You confirmed this sign works in your setup
 DEFAULT_LAT_SIGN = -1
 
 POINT_COLOR = (0, 255, 0)
 TARGET_COLOR = (0, 165, 255)
 APPROACH_COLOR = (255, 0, 255)
 HOME_COLOR = (255, 255, 0)
-LINE_COLOR = (0, 165, 255)
 ROBOT_COLOR = (0, 255, 255)
 HUD_COLOR = (255, 0, 0)
 CLICK_COLOR = (255, 0, 255)
 
+AXIS_COLOR_X = (0, 255, 255)   # X axis
+AXIS_COLOR_Y = (255, 255, 0)   # Y axis
+
 
 class MissionState(str, Enum):
     NEED_HOME = "NEED_HOME"
+
     GO_TARGET_APPROACH = "GO_TARGET_APPROACH"
     FACE_TARGET = "FACE_TARGET"
     GO_TARGET_FINAL = "GO_TARGET_FINAL"
     WAIT_TARGET = "WAIT_TARGET"
-    GO_HOME = "GO_HOME"
+
+    BACK_TO_TARGET_APPROACH = "BACK_TO_TARGET_APPROACH"
+
+    GO_HOME_APPROACH = "GO_HOME_APPROACH"
+    GO_HOME_FINAL = "GO_HOME_FINAL"
+
     WAIT_HOME = "WAIT_HOME"
+
     DONE = "DONE"
     PAUSED = "PAUSED"
 
@@ -75,6 +88,9 @@ class Mission:
     state_enter_time: float = 0.0
     paused_resume_state: MissionState = MissionState.NEED_HOME
 
+    # requirement: do NOT start by going to home-approach
+    have_completed_first_target: bool = False
+
     def current_target(self) -> Optional[Tuple[float, float]]:
         if not self.targets_xy:
             return None
@@ -87,6 +103,12 @@ class Mission:
         if t is None:
             return None
         return (t[0] - APPROACH_BEFORE_X_M, t[1])
+
+    def home_approach(self) -> Optional[Tuple[float, float]]:
+        if self.home_xy is None:
+            return None
+        # +X of HOME
+        return (self.home_xy[0] + APPROACH_BEFORE_X_M, self.home_xy[1])
 
 
 def bgra_to_bgr(bgra: np.ndarray) -> np.ndarray:
@@ -166,6 +188,45 @@ def draw_robot(img, robot: RobotPose2D, ksys: KinectGridSystem) -> Optional[Tupl
     return None
 
 
+def draw_axes_on_floor(img: np.ndarray, ksys: KinectGridSystem, axis_len_m: float = 0.60) -> None:
+    frame = ksys.grid_frame
+    if frame is None:
+        return
+
+    pts_grid = [
+        (0.0, 0.0),
+        (axis_len_m, 0.0),
+        (0.0, axis_len_m),
+    ]
+
+    uvs: list[Optional[Tuple[int, int]]] = []
+    for gx, gy in pts_grid:
+        p_cam = grid_xy_to_camera(gx, gy, frame)
+        uvf = map_camera_point_to_color_xy(ksys.kinect, p_cam)
+        if uvf is None:
+            uvs.append(None)
+            continue
+        u, v = int(uvf[0]), int(uvf[1])
+        if 0 <= u < img.shape[1] and 0 <= v < img.shape[0]:
+            uvs.append((u, v))
+        else:
+            uvs.append(None)
+
+    o, px, py = uvs
+    if o is None:
+        return
+
+    cv2.circle(img, o, 6, (255, 255, 255), -1, cv2.LINE_AA)
+
+    if px is not None:
+        cv2.arrowedLine(img, o, px, AXIS_COLOR_X, 3, cv2.LINE_AA, tipLength=0.18)
+        cv2.putText(img, "+X", (px[0] + 6, px[1] + 6), cv2.FONT_HERSHEY_SIMPLEX, 0.8, AXIS_COLOR_X, 2, cv2.LINE_AA)
+
+    if py is not None:
+        cv2.arrowedLine(img, o, py, AXIS_COLOR_Y, 3, cv2.LINE_AA, tipLength=0.18)
+        cv2.putText(img, "+Y", (py[0] + 6, py[1] + 6), cv2.FONT_HERSHEY_SIMPLEX, 0.8, AXIS_COLOR_Y, 2, cv2.LINE_AA)
+
+
 def make_targets_row_by_row_like_image() -> List[Tuple[float, float]]:
     s = GRID_SPACING_M
     ys = [-s, 0.0, +s]
@@ -200,17 +261,18 @@ def main() -> int:
         kinect_sys=ksys,
         strictness=ARUCO_STRICTNESS,
         robot_id=ROBOT_ARUCO_ID,
+        alt_ids=ROBOT_ALT_IDS,
         preferred_dict=PREFERRED_ARUCO_DICT,
         heading_offset_deg=HEADING_OFFSET_DEG,
         min_marker_size_px=MIN_MARKER_SIZE_PX,
     )
 
-    # Forward/back is now genuinely slower (near speed is ~7000 = just above deadzone)
     gains = AxisGains(
         axis_fwd_fast=9000,
         axis_fwd_near=7000,
         axis_lat_mag=16000,
-        axis_yaw_mag=11000,
+        axis_yaw_mag=9600,
+        axis_yaw_mag_target=9600,
         axis_tol_m=0.03,
         arrive_radius_m=0.07,
         stable_reach_ticks=4,
@@ -219,6 +281,9 @@ def main() -> int:
         turn_tol_deg=8.0,
         latch_turn=True,
         bump_over_deadzone=True,
+        target_yaw_start_deg=15.0,
+        yaw_pulse_period=3,
+        yaw_pulse_on=1,
     )
     ctrl = AxisStepController(gains)
     ctrl.set_lateral_sign(DEFAULT_LAT_SIGN)
@@ -249,6 +314,7 @@ def main() -> int:
             mission.home_xy = None
             mission.targets_xy = []
             mission.target_index = 0
+            mission.have_completed_first_target = False
             set_state(MissionState.NEED_HOME)
             ctrl.reset()
             ctrl.set_lateral_sign(DEFAULT_LAT_SIGN)
@@ -280,8 +346,15 @@ def main() -> int:
             if bgra is None:
                 time.sleep(0.002)
                 continue
+
+            # Base frame
             bgr = bgra_to_bgr(bgra)
 
+            # --- IMPORTANT: detect on a pristine frame, never on an annotated frame ---
+            bgr_detect = np.ascontiguousarray(bgr.copy())
+            robot: Optional[RobotPose2D] = tracker.detect_and_estimate(bgr_detect)
+
+            # Now draw everything on the display frame (bgr)
             if clicked_color_xy is not None and ksys.grid_frame is None and ksys.plane is not None:
                 ok = ksys.set_grid_center_from_color_click(clicked_color_xy, search_radius=160)
                 status_msg = "Grid origin set ✅. Put robot at HOME and press 'h'." if ok else "Could not set origin yet. Click again or wait."
@@ -289,9 +362,9 @@ def main() -> int:
             if clicked_color_xy is not None:
                 draw_marker_cross(bgr, clicked_color_xy[0], clicked_color_xy[1])
 
+            draw_axes_on_floor(bgr, ksys, axis_len_m=0.60)
             draw_grid_points(bgr, ksys, GRID_SPACING_M)
 
-            robot: Optional[RobotPose2D] = tracker.detect_and_estimate(bgr)
             tracker.draw_debug(bgr)
 
             now = time.monotonic()
@@ -332,13 +405,19 @@ def main() -> int:
 
             cur_t = mission.current_target()
             cur_a = mission.current_approach()
+            home_a = mission.home_approach()
 
+            # draw points
             if mission.home_xy is not None:
                 draw_goal_point(bgr, ksys, mission.home_xy, "HOME", HOME_COLOR, radius=10)
+                if mission.have_completed_first_target and home_a is not None:
+                    draw_goal_point(bgr, ksys, home_a, "H-APP", APPROACH_COLOR, radius=8)
+
             if cur_t is not None:
                 draw_goal_point(bgr, ksys, cur_a, "APP", APPROACH_COLOR, radius=8)
                 draw_goal_point(bgr, ksys, cur_t, f"T{mission.target_index+1}", TARGET_COLOR, radius=10)
 
+            # ---------- Control loop ----------
             if now >= next_control:
                 next_control = now + dt
 
@@ -365,18 +444,18 @@ def main() -> int:
                                 ctrl.reset()
                                 ctrl.set_lateral_sign(DEFAULT_LAT_SIGN)
                                 set_state(MissionState.FACE_TARGET)
-                                status_msg = "At APPROACH. Turning slowly to face target..."
+                                status_msg = "At target APPROACH. Micro-yaw (if needed) to face target..."
                             else:
                                 commander.send_axes(out.ax, out.ay, out.az)
 
                         elif mission.state == MissionState.FACE_TARGET:
-                            out = ctrl.turn_to_face(robot, cur_t)
+                            out = ctrl.turn_to_face_small(robot, cur_t)
                             if out.reached:
                                 commander.stop_robot()
                                 ctrl.reset()
                                 ctrl.set_lateral_sign(DEFAULT_LAT_SIGN)
                                 set_state(MissionState.GO_TARGET_FINAL)
-                                status_msg = "Facing target. Forward slowly..."
+                                status_msg = "Facing target (or yaw skipped). Forward slowly..."
                             else:
                                 commander.send_axes(out.ax, out.ay, out.az)
 
@@ -394,12 +473,37 @@ def main() -> int:
                         elif mission.state == MissionState.WAIT_TARGET:
                             commander.stop_robot()
                             if (now - mission.state_enter_time) >= PAUSE_AT_TARGET_S:
-                                set_state(MissionState.GO_HOME)
+                                set_state(MissionState.BACK_TO_TARGET_APPROACH)
                                 ctrl.reset()
                                 ctrl.set_lateral_sign(DEFAULT_LAT_SIGN)
-                                status_msg = "Returning HOME..."
+                                status_msg = "Waiting done. Backing to target APPROACH..."
 
-                        elif mission.state == MissionState.GO_HOME:
+                        elif mission.state == MissionState.BACK_TO_TARGET_APPROACH:
+                            out = ctrl.backward_to_point(robot, cur_a)
+                            if out.reached:
+                                commander.stop_robot()
+                                ctrl.reset()
+                                ctrl.set_lateral_sign(DEFAULT_LAT_SIGN)
+
+                                mission.have_completed_first_target = True
+                                set_state(MissionState.GO_HOME_APPROACH)
+                                status_msg = "At target APPROACH. Going to HOME-APPROACH..."
+                            else:
+                                commander.send_axes(out.ax, out.ay, out.az)
+
+                        elif mission.state == MissionState.GO_HOME_APPROACH:
+                            goal = home_a if (mission.have_completed_first_target and home_a is not None) else mission.home_xy
+                            out = ctrl.move_to_point_y_then_x(robot, goal)
+                            if out.reached:
+                                commander.stop_robot()
+                                ctrl.reset()
+                                ctrl.set_lateral_sign(DEFAULT_LAT_SIGN)
+                                set_state(MissionState.GO_HOME_FINAL)
+                                status_msg = "At HOME-APPROACH. Translating to HOME (no yaw)..."
+                            else:
+                                commander.send_axes(out.ax, out.ay, out.az)
+
+                        elif mission.state == MissionState.GO_HOME_FINAL:
                             out = ctrl.move_to_point_y_then_x(robot, mission.home_xy)
                             if out.reached:
                                 commander.stop_robot()
@@ -428,13 +532,15 @@ def main() -> int:
                             ctrl.reset()
                             ctrl.set_lateral_sign(DEFAULT_LAT_SIGN)
 
+            # ---------- HUD ----------
             hud = [
                 status_msg,
                 f"UDP: RUNNING robot={robot_ip}:{robot_port} (MOTION=MOVE)",
                 f"Mission: {mission.state}  target={mission.target_index+1 if mission.current_target() else '-'} / {len(mission.targets_xy) if mission.targets_xy else '-'}",
                 f"Home: {'SET' if mission.home_xy else 'NOT SET'}  GridOrigin: {'SET' if ksys.grid_frame else 'NOT SET'}",
-                f"Robot{ROBOT_ARUCO_ID}: seen={marker_seen} pose={'OK' if robot else '---'} strict={ARUCO_STRICTNESS:.2f}",
-                f"Axis knobs: fwd_fast={gains.axis_fwd_fast} fwd_near={gains.axis_fwd_near} lat={gains.axis_lat_mag} yaw={gains.axis_yaw_mag} lat_sign={ctrl.get_lateral_sign():+d}",
+                f"RobotIDs: primary={ROBOT_ARUCO_ID} alt={ROBOT_ALT_IDS}  seen={marker_seen} pose={'OK' if robot else '---'} det_id={tracker.last_detected_id} strict={ARUCO_STRICTNESS:.2f}",
+                f"Axis knobs: fwd_fast={gains.axis_fwd_fast} fwd_near={gains.axis_fwd_near} lat={gains.axis_lat_mag} yawT={gains.axis_yaw_mag_target} lat_sign={ctrl.get_lateral_sign():+d}",
+                f"TargetYaw: skip<{gains.target_yaw_start_deg:.0f}deg pulse={gains.yaw_pulse_on}/{gains.yaw_pulse_period} tol={gains.turn_tol_deg:.1f}deg",
                 f"Plane: {'LOCKED' if ksys.plane_locked else 'CALIBRATING'} Fits: {ksys.fit_count}/{FITS_TO_LOCK}",
                 "Keys: q/ESC quit, p pause/resume, SPACE stop, r recalibrate, h set HOME at robot position",
             ]
@@ -485,6 +591,7 @@ def main() -> int:
                 mission.home_xy = None
                 mission.targets_xy = []
                 mission.target_index = 0
+                mission.have_completed_first_target = False
                 set_state(MissionState.NEED_HOME)
                 status_msg = "Recalibrating. Left-click GRID CENTER again."
                 ctrl.set_lateral_sign(DEFAULT_LAT_SIGN)
