@@ -3,11 +3,12 @@ from __future__ import annotations
 """
 Lite3 UDP commander (SAFE SUBSET).
 
-We ONLY use:
+We use:
 - heartbeat
 - control mode: MANUAL
-- motion mode: MOVE/POSE
-- axis commands (MOVE): X / Y / YAW
+- motion mode: MOVE / POSE
+- MOVE axes: X / Y / YAW
+- POSE axis: BODY HEIGHT (for gentle lowering at target)
 
 No action skills, no gait changes, no flips.
 """
@@ -36,15 +37,22 @@ CMD_STAND_SIT_TOGGLE = 0x21010202
 CMD_AXIS_X = 0x21010130   # forward/back
 CMD_AXIS_Y = 0x21010131   # left/right (positive -> RIGHT)
 CMD_AXIS_YAW = 0x21010135 # turning (firmware often: positive -> RIGHT)
+
+# POSE axis (body height)
+CMD_AXIS_BODY_HEIGHT = 0x21010102  # pose mode: adjust body height
+
 # ----------------------------------------------
 
 AXIS_MIN = -32767
 AXIS_MAX = 32767
 
-# Deadzones you confirmed
+# Deadzones you confirmed (MOVE mode)
 DEADZONE_X = 6553
 DEADZONE_Y = 12553
 DEADZONE_YAW = 9553
+
+# Pose-mode body height deadzone from your manual/script: [-20000, 20000] treated as 0
+DEADZONE_BODY_HEIGHT = 20000
 
 
 @dataclass(frozen=True)
@@ -77,6 +85,17 @@ def build_simple_command(code: int, value: int = 0, cmd_type: int = 0) -> bytes:
 
 def _apply_deadzone_or_zero(v: int, dead: int) -> int:
     return 0 if abs(v) <= dead else v
+
+
+def _ensure_outside_deadzone(v: int, dead: int, bump: int = 500) -> int:
+    """
+    If abs(v) <= dead, robot treats it as 0. Push just outside.
+    """
+    if v == 0:
+        return 0
+    if abs(v) <= dead:
+        v = (dead + bump) if v > 0 else -(dead + bump)
+    return _clamp_axis(v)
 
 
 class Lite3UdpCommander:
@@ -195,6 +214,17 @@ class Lite3UdpCommander:
         self._sock.sendto(build_simple_command(CMD_AXIS_Y, y_axis, 0), self._addr)
         self._sock.sendto(build_simple_command(CMD_AXIS_YAW, yaw_axis, 0), self._addr)
 
+    # ------------------ POSE: BODY HEIGHT ------------------
+    def send_body_height_axis_once(self, axis_value: int) -> None:
+        """
+        Pose mode body height axis.
+        Must be outside deadzone (|v| > 20000) or it does nothing.
+        """
+        v = int(axis_value)
+        v = _ensure_outside_deadzone(v, DEADZONE_BODY_HEIGHT, bump=500)
+        self._sock.sendto(build_simple_command(CMD_AXIS_BODY_HEIGHT, v, 0), self._addr)
+
+    # ------------------ Threads ------------------
     def _heartbeat_loop(self) -> None:
         pkt = build_simple_command(CMD_HEARTBEAT, 0, 0)
         while not self._stop_evt.is_set():

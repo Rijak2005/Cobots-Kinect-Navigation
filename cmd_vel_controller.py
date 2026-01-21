@@ -74,6 +74,9 @@ class AxisGains:
     yaw_pulse_period: int = 3
     yaw_pulse_on: int = 1
 
+    # IMPORTANT: no diagonal body motion (use guide rails, avoid mixing ax/ay)
+    no_diagonal_body_motion: bool = True
+
 
 @dataclass
 class AxisOut:
@@ -87,11 +90,16 @@ class AxisOut:
 
 class AxisStepController:
     """
-    Translation-first controller:
-      - move_to_point_y_then_x: translation only (NO yaw)
+    Controller modes:
+      - move_to_point_y_then_x:
+          If no_diagonal_body_motion=True:
+              Y phase -> ay only (ax=0)
+              X phase -> ax only (ay=0)
+          This guarantees NO diagonal commands.
       - turn_to_face_small: micro-yaw (pulsed) with skip threshold (used at TARGET approach)
-      - forward_to_point: final forward/back based on world dx (used at TARGET final)
-      - backward_to_point: reverse slowly (used to back out from target to approach)
+      - forward_to_point: final forward/back only (TARGET final)
+      - backward_to_point: reverse slowly
+      - dock_x_only_to_point: forward/back only for rails entry/exit
     """
 
     def __init__(self, g: AxisGains) -> None:
@@ -166,7 +174,7 @@ class AxisStepController:
         ay = self._bump(ay, DZ_Y)
         return ax, ay
 
-    # -------- translation-only travel (NO yaw) --------
+    # -------- translation-only travel --------
     def move_to_point_y_then_x(self, robot: RobotPose2D, goal: Tuple[float, float]) -> AxisOut:
         self._new_goal_if_needed(goal)
 
@@ -176,6 +184,28 @@ class AxisStepController:
         if self._reached(robot, goal):
             return AxisOut(0, 0, 0, True, "REACHED", "Reached (stable)")
 
+        # ---- NO DIAGONAL MODE: one axis at a time in BODY space ----
+        if self.g.no_diagonal_body_motion:
+            # Phase: reduce WORLD Y by commanding ONLY ay (strafe)
+            if self._phase_axis == "Y":
+                if abs(ey) <= self.g.axis_tol_m:
+                    self._phase_axis = "X"
+                else:
+                    ay = self.g.axis_lat_mag if ey > 0 else -self.g.axis_lat_mag
+                    ay = int(self._lat_sign * ay)
+                    ay = self._bump(clamp_axis(ay), DZ_Y)
+                    return AxisOut(0, ay, 0, False, "MOVE_Y_ONLY", f"Y-only (no diagonal) ey={ey:+.3f}m")
+
+            # Phase: reduce WORLD X by commanding ONLY ax (forward/back)
+            if abs(ex) > self.g.axis_tol_m:
+                mag = self._pick_fwd_mag(ex, self.g.slow_x_m)
+                ax = mag if ex > 0 else -mag
+                ax = self._bump(clamp_axis(ax), DZ_X)
+                return AxisOut(ax, 0, 0, False, "MOVE_X_ONLY", f"X-only (no diagonal) ex={ex:+.3f}m mag={mag}")
+
+            return AxisOut(0, 0, 0, False, "HOLD", "Inside axis tolerance, holding")
+
+        # ---- OLD MODE (heading-aware, can produce diagonal ax+ay) ----
         # WORLD Y first
         if self._phase_axis == "Y":
             if abs(ey) <= self.g.axis_tol_m:
@@ -220,21 +250,18 @@ class AxisStepController:
         if not pulse:
             return AxisOut(0, 0, az, False, "TURN", f"Turn err={math.degrees(err_rad):+.1f}°")
 
-        # pulsed yaw to reduce overshoot
         self._yaw_tick += 1
         period = max(1, int(self.g.yaw_pulse_period))
         on = max(0, min(period, int(self.g.yaw_pulse_on)))
         in_on_window = ((self._yaw_tick - 1) % period) < on
         az_out = az if in_on_window else 0
 
-        return AxisOut(0, 0, az_out, False, "TURN_PULSE", f"Pulsed yaw err={math.degrees(err_rad):+.1f}° az={'ON' if in_on_window else 'OFF'}")
+        return AxisOut(
+            0, 0, az_out, False, "TURN_PULSE",
+            f"Pulsed yaw err={math.degrees(err_rad):+.1f}° az={'ON' if in_on_window else 'OFF'}"
+        )
 
     def turn_to_face_small(self, robot: RobotPose2D, face_goal: Tuple[float, float]) -> AxisOut:
-        """
-        For TARGET approach only:
-          - skip yaw if error is small
-          - otherwise pulsed micro-yaw
-        """
         if self._yaw_target_lock != face_goal:
             self._yaw_target_lock = face_goal
             self._yaw_tick = 0
@@ -251,7 +278,7 @@ class AxisStepController:
 
         return self._yaw_cmd(err, yaw_mag=int(self.g.axis_yaw_mag_target), pulse=True)
 
-    # -------- final approach (TARGET): forward/back only based on world dx --------
+    # -------- final approach (TARGET): forward/back only --------
     def forward_to_point(self, robot: RobotPose2D, goal: Tuple[float, float]) -> AxisOut:
         if self._reached(robot, goal):
             return AxisOut(0, 0, 0, True, "REACHED", "Reached (stable)")
@@ -275,3 +302,24 @@ class AxisStepController:
         dy = goal[1] - robot.y
         dist = math.hypot(dx, dy)
         return AxisOut(ax, 0, 0, False, "BACK", f"Backward only mag={mag} dist={dist:.2f}m")
+
+    # -------- dock rails: X-only forward/back --------
+    def dock_x_only_to_point(
+        self,
+        robot: RobotPose2D,
+        goal: Tuple[float, float],
+        dock_fwd_near: int,
+        dock_fwd_fast: int,
+        dock_slow_m: float = 0.35,
+    ) -> AxisOut:
+        if self._reached(robot, goal):
+            return AxisOut(0, 0, 0, True, "REACHED", "Reached (stable)")
+
+        dx = goal[0] - robot.x
+        mag = dock_fwd_near if abs(dx) < dock_slow_m else dock_fwd_fast
+
+        ax = mag if dx >= 0 else -mag
+        ax = self._bump(clamp_axis(ax), DZ_X)
+
+        dist = math.hypot(goal[0] - robot.x, goal[1] - robot.y)
+        return AxisOut(ax, 0, 0, False, "DOCK_X", f"Dock X-only mag={mag} dx={dx:+.3f}m dist={dist:.2f}m")
