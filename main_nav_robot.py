@@ -15,6 +15,12 @@ from robot_tracker import ArucoRobotTrackerAuto, RobotPose2D
 from cmd_vel_controller import AxisStepController, AxisGains, AxisOut
 from lite3_udp_commander import Lite3UdpCommander, Lite3UdpConfig
 
+# --- NEW: MQTT (gripper) ---
+try:
+    import paho.mqtt.client as mqtt  # pip install paho-mqtt
+except Exception:
+    mqtt = None
+
 
 WINDOW_NAME = "Kinect v2 - Robot Mission (HOME <-> GRID)"
 DISPLAY_SCALE = 0.7
@@ -37,6 +43,14 @@ HOME_APPROACH_X = 1.30
 # back out a bit more than the approach point (approach + extra)
 BACK_EXTRA_M = 0.20
 
+# --- NEW: Gripper placement offset (gripper is on BACK of robot) ---
+# We drive the *robot center* past the target by this amount so the gripper lines up on the mark.
+GRIPPER_OFFSET_X_M = 0.23  # 5 cm; you can tune later
+
+# --- NEW: HOME wait + grip close timing ---
+HOME_WAIT_BEFORE_GRIP_S = 5.0
+GRIPPER_ACTION_SETTLE_S = 2  # allow servo to move after MQTT command
+
 # Pose / body height knobs (deadzone for body height is |v| > 20000)
 TARGET_LOWER_AXIS = -32000  # knob
 LOWER_RAMP_S = 2.0
@@ -52,7 +66,7 @@ ROI_X_FRAC = (0.10, 0.90)
 ROI_Y_FRAC = (0.20, 0.95)
 
 CONTROL_HZ = 12.0
-PAUSE_AT_HOME_S = 1.0
+PAUSE_AT_HOME_S = 1.0  # (kept, but we add our own 5s wait before grip)
 
 LOST_TIMEOUT_S = 0.80
 
@@ -73,13 +87,110 @@ CLICK2_COLOR = (0, 255, 255)  # tape +X
 AXIS_COLOR_X = (0, 255, 255)
 AXIS_COLOR_Y = (255, 255, 0)
 
+# --- NEW: MQTT config (must match your ESP code) ---
+MQTT_HOST = "broker.hivemq.com"
+MQTT_PORT = 1883
+MQTT_TOPIC_PREFIX = "rijakisthebest/cobots"  # ESP32 uses: PREFIX + "/turn" and PREFIX + "/grip"
+
+
+class MqttGripper:
+    """
+    Minimal, safe MQTT publisher:
+      - non-blocking connect
+      - publish queued commands
+      - loop() called each frame
+    """
+    def __init__(self, host: str, port: int, prefix: str) -> None:
+        self.host = host
+        self.port = int(port)
+        self.prefix = prefix.strip().strip("/")
+        self.client = None
+        self.connected = False
+        self._last_err: str = ""
+        self._want_connect = True
+
+        if mqtt is None:
+            return
+
+        self.client = mqtt.Client(client_id=f"nav-{int(time.time())}", clean_session=True)
+        self.client.on_connect = self._on_connect
+        self.client.on_disconnect = self._on_disconnect
+
+    def _on_connect(self, client, userdata, flags, rc) -> None:
+        self.connected = (rc == 0)
+        self._last_err = "" if self.connected else f"MQTT rc={rc}"
+
+    def _on_disconnect(self, client, userdata, rc) -> None:
+        self.connected = False
+        self._last_err = f"MQTT disconnected rc={rc}"
+
+    def loop(self) -> None:
+        if self.client is None:
+            return
+        try:
+            # keep network pumping
+            self.client.loop(timeout=0.0)
+        except Exception as e:
+            self.connected = False
+            self._last_err = f"MQTT loop err: {e}"
+
+        if self._want_connect and (not self.connected):
+            try:
+                # non-blocking connect attempt (short timeout)
+                self.client.connect_async(self.host, self.port, keepalive=30)
+                self.client.loop_start()
+                # After loop_start, loop() is handled in background thread; still OK to call loop() too.
+                self._want_connect = False
+            except Exception as e:
+                self._last_err = f"MQTT connect err: {e}"
+
+    def topic_turn(self) -> str:
+        return f"{self.prefix}/turn" if self.prefix else "turn"
+
+    def topic_grip(self) -> str:
+        return f"{self.prefix}/grip" if self.prefix else "grip"
+
+    def publish_turn(self, payload: str) -> bool:
+        if self.client is None:
+            return False
+        try:
+            self.client.publish(self.topic_turn(), payload, qos=0, retain=False)
+            return True
+        except Exception as e:
+            self._last_err = f"MQTT pub turn err: {e}"
+            return False
+
+    def publish_grip(self, payload: str) -> bool:
+        if self.client is None:
+            return False
+        try:
+            self.client.publish(self.topic_grip(), payload, qos=0, retain=False)
+            return True
+        except Exception as e:
+            self._last_err = f"MQTT pub grip err: {e}"
+            return False
+
+    def status_line(self) -> str:
+        if mqtt is None:
+            return "MQTT: paho-mqtt NOT installed (pip install paho-mqtt)"
+        if self.connected:
+            return f"MQTT: connected {self.host}:{self.port} prefix={self.prefix}"
+        if self._last_err:
+            return f"MQTT: not connected ({self._last_err})"
+        return f"MQTT: connecting {self.host}:{self.port} ..."
+
 
 class MissionState(str, Enum):
     NEED_HOME = "NEED_HOME"
 
     GO_TARGET_APPROACH = "GO_TARGET_APPROACH"
-    FACE_TARGET = "FACE_TARGET"
+    FACE_TARGET = "FACE_TARGET"   # kept, but we will SKIP yaw (never used)
     GO_TARGET_FINAL = "GO_TARGET_FINAL"
+
+    # --- NEW: gripper sequence around target ---
+    TARGET_TURN_FOR_PLACE = "TARGET_TURN_FOR_PLACE"
+    TARGET_OPEN_GRIP = "TARGET_OPEN_GRIP"
+    TARGET_TURN_BACK = "TARGET_TURN_BACK"
 
     TARGET_LOWER = "TARGET_LOWER"
     TARGET_HOLD_LOW = "TARGET_HOLD_LOW"
@@ -89,6 +200,9 @@ class MissionState(str, Enum):
 
     GO_HOME_APPROACH = "GO_HOME_APPROACH"
     GO_HOME_FINAL = "GO_HOME_FINAL"
+
+    # --- NEW: wait 5s at home then CLOSE gripper once ---
+    WAIT_HOME_BEFORE_GRIP = "WAIT_HOME_BEFORE_GRIP"
     WAIT_HOME = "WAIT_HOME"
 
     DONE = "DONE"
@@ -131,6 +245,13 @@ class Mission:
         if self.home_xy is None:
             return None
         return (self.home_xy[0] + HOME_APPROACH_X, self.home_xy[1])
+
+    # --- NEW: placement goal (robot center goes past target so BACK gripper aligns) ---
+    def current_place_goal(self) -> Optional[Tuple[float, float]]:
+        t = self.current_target()
+        if t is None:
+            return None
+        return (t[0] + GRIPPER_OFFSET_X_M, t[1])
 
 
 def bgra_to_bgr(bgra: np.ndarray) -> np.ndarray:
@@ -312,26 +433,19 @@ def reorder_targets_by_x_then_y(ctrl_targets: List[Tuple[float, float]]) -> List
     if not ctrl_targets:
         return ctrl_targets
 
-    # If it's not exactly 9, fall back to simple sort
     if len(ctrl_targets) != 9:
         return sorted(ctrl_targets, key=lambda p: (-p[0], p[1]))
 
-    # 1) Sort by X descending
     pts = sorted(ctrl_targets, key=lambda p: p[0], reverse=True)
-
-    # 2) Take top 3 as row1, next 3 row2, last 3 row3
     rows = [pts[0:3], pts[3:6], pts[6:9]]
 
-    # 3) Sort each row by Y ascending: (-0.60, 0, +0.60)
     for r in rows:
         r.sort(key=lambda p: p[1])
 
-    # 4) Flatten
     out: List[Tuple[float, float]] = []
     for r in rows:
         out.extend(r)
     return out
-
 
 
 def _deadzone_safe_lower_value(v: int) -> int:
@@ -370,6 +484,10 @@ def main() -> int:
     commander.start()
     commander.set_motion_mode("move")
 
+    # --- NEW: MQTT gripper publisher ---
+    gr = MqttGripper(MQTT_HOST, MQTT_PORT, MQTT_TOPIC_PREFIX)
+    gr.loop()  # kick off connect attempt
+
     ksys = KinectGridSystem(plane_smooth_alpha=0.15)
     display_w = int(ksys.color_w * DISPLAY_SCALE)
     display_h = int(ksys.color_h * DISPLAY_SCALE)
@@ -407,7 +525,7 @@ def main() -> int:
     ctrl = AxisStepController(gains)
     ctrl.set_lateral_sign(DEFAULT_LAT_SIGN)
 
-    # --- NEW: 2-click calibration state ---
+    # --- 2-click calibration state ---
     click1_color_xy: Optional[Tuple[float, float]] = None  # origin
     click2_color_xy: Optional[Tuple[float, float]] = None  # tape +X
 
@@ -425,6 +543,12 @@ def main() -> int:
     pose_lower = _deadzone_safe_lower_value(TARGET_LOWER_AXIS)
     pose_last_send_t = 0.0
     pose_send_dt = 1.0 / max(5.0, float(POSE_SEND_HZ))
+
+    # --- NEW: latches so MQTT commands happen once per visit ---
+    home_grip_sent = False
+    target_turn_sent = False
+    target_open_sent = False
+    target_turnback_sent = False
 
     # -------- Logging setup (CSV) --------
     _ensure_dir("logs")
@@ -524,6 +648,7 @@ def main() -> int:
 
     def reset_calib_and_mission() -> None:
         nonlocal click1_color_xy, click2_color_xy, targets_order_lines, status_msg
+        nonlocal home_grip_sent, target_turn_sent, target_open_sent, target_turnback_sent
         click1_color_xy = None
         click2_color_xy = None
         ksys.grid_frame = None
@@ -534,6 +659,12 @@ def main() -> int:
         targets_order_lines = []
         mission.target_index = 0
         mission.have_completed_first_target = False
+
+        home_grip_sent = False
+        target_turn_sent = False
+        target_open_sent = False
+        target_turnback_sent = False
+
         set_state(MissionState.NEED_HOME)
         ctrl.reset()
         ctrl.set_lateral_sign(DEFAULT_LAT_SIGN)
@@ -565,7 +696,6 @@ def main() -> int:
                     status_msg = "Click #2 failed (too close or mapping). Click a farther point along +X tape direction."
 
             else:
-                # update tape axis if user clicks again
                 click2_color_xy = cxy
                 ok = ksys.set_tape_axis_from_color_click(cxy, search_radius=160, min_axis_len_m=0.20)
                 status_msg = "Tape axis updated ✅." if ok else "Tape axis update failed; try again."
@@ -580,6 +710,9 @@ def main() -> int:
 
     try:
         while True:
+            # --- NEW: keep MQTT alive ---
+            gr.loop()
+
             if not ksys.update_frames():
                 time.sleep(0.002)
                 continue
@@ -612,10 +745,8 @@ def main() -> int:
             if click2_color_xy is not None:
                 draw_marker_cross(bgr, click2_color_xy[0], click2_color_xy[1], CLICK2_COLOR, "C2(+X)")
 
-            # Draw axes/grid
             draw_axes_on_floor(bgr, ksys, axis_len_m=0.60)
             draw_grid_points(bgr, ksys, GRID_SPACING_M)
-
             tracker.draw_debug(bgr)
 
             now = time.monotonic()
@@ -671,7 +802,6 @@ def main() -> int:
                 ctrl.reset()
                 ctrl.set_lateral_sign(DEFAULT_LAT_SIGN)
 
-            # Draw all target numbers (overlay)
             if mission.targets_xy:
                 draw_all_target_numbers(bgr, ksys, mission.targets_xy)
 
@@ -679,6 +809,7 @@ def main() -> int:
             cur_a = mission.current_approach()
             cur_back = mission.current_backout_goal()
             home_a = mission.home_approach()
+            cur_place = mission.current_place_goal()
 
             if mission.home_xy is not None:
                 draw_goal_point(bgr, ksys, mission.home_xy, "HOME", HOME_COLOR, radius=10)
@@ -689,6 +820,8 @@ def main() -> int:
                 draw_goal_point(bgr, ksys, cur_a, "APP", APPROACH_COLOR, radius=8)
                 draw_goal_point(bgr, ksys, cur_back, "BACK", (200, 50, 200), radius=7)
                 draw_goal_point(bgr, ksys, cur_t, f"T{mission.target_index+1}", TARGET_COLOR, radius=10)
+                # --- NEW: show placement goal too ---
+                draw_goal_point(bgr, ksys, cur_place, "PLACE(+off)", (80, 200, 80), radius=7)
 
             # ---------- Control loop ----------
             if now >= next_control:
@@ -729,51 +862,63 @@ def main() -> int:
                             out = ctrl.move_to_point_y_then_x(robot, cur_a)
                             last_out = out
                             if out.reached:
-                                commander.stop_robot()
-                                ctrl.reset()
-                                ctrl.set_lateral_sign(DEFAULT_LAT_SIGN)
-                                set_state(MissionState.FACE_TARGET)
-                                status_msg = "At target APPROACH. Micro-yaw (if needed) to face target..."
-                                last_sent = (0, 0, 0)
-                            else:
-                                commander.send_axes(out.ax, out.ay, out.az)
-                                last_sent = (out.ax, out.ay, out.az)
-                            log_tick(now, mission.state, marker_seen, robot, goal_for_log, last_out, last_sent, last_pose_cmd, "")
-
-                        elif mission.state == MissionState.FACE_TARGET:
-                            goal_for_log = cur_t
-                            out = ctrl.turn_to_face_small(robot, cur_t)
-                            last_out = out
-                            if out.reached:
+                                # --- CHANGE: SKIP yaw step entirely (you said no yaw) ---
                                 commander.stop_robot()
                                 ctrl.reset()
                                 ctrl.set_lateral_sign(DEFAULT_LAT_SIGN)
                                 set_state(MissionState.GO_TARGET_FINAL)
-                                status_msg = "Facing target (or yaw skipped). Forward slowly..."
+                                status_msg = "At target APPROACH. Yaw skipped (NO YAW). Forward slowly..."
                                 last_sent = (0, 0, 0)
                             else:
-                                commander.send_axes(out.ax, out.ay, out.az)
-                                last_sent = (out.ax, out.ay, out.az)
+                                # Always enforce az=0 (extra safety)
+                                commander.send_axes(out.ax, out.ay, 0)
+                                last_sent = (out.ax, out.ay, 0)
                             log_tick(now, mission.state, marker_seen, robot, goal_for_log, last_out, last_sent, last_pose_cmd, "")
 
+                        # FACE_TARGET remains defined but is never entered now
+                        elif mission.state == MissionState.FACE_TARGET:
+                            commander.stop_robot()
+                            set_state(MissionState.GO_TARGET_FINAL)
+                            status_msg = "FACE_TARGET skipped."
+                            log_tick(now, mission.state, marker_seen, robot, None, None, (0, 0, 0), 0, "face_skipped")
+
                         elif mission.state == MissionState.GO_TARGET_FINAL:
-                            goal_for_log = cur_t
-                            out = ctrl.forward_to_point(robot, cur_t)
+                            # --- CHANGE: drive to placement goal (target + offset) ---
+                            goal_for_log = cur_place
+                            out = ctrl.forward_to_point(robot, cur_place)
                             last_out = out
                             if out.reached:
                                 commander.stop_robot()
                                 ctrl.reset()
                                 ctrl.set_lateral_sign(DEFAULT_LAT_SIGN)
 
-                                set_state(MissionState.TARGET_LOWER)
-                                status_msg = f"At target {mission.target_index+1}. Lowering body (POSE)..."
-                                commander.set_motion_mode("pose")
+                                # reset per-target latches
+                                target_turn_sent = False
+                                target_open_sent = False
+                                target_turnback_sent = False
+
+                                set_state(MissionState.TARGET_TURN_FOR_PLACE)
+                                status_msg = f"At PLACE goal (target+{GRIPPER_OFFSET_X_M*100:.0f}cm). Turning gripper..."
                                 last_sent = (0, 0, 0)
                             else:
-                                commander.send_axes(out.ax, out.ay, out.az)
-                                last_sent = (out.ax, out.ay, out.az)
+                                commander.send_axes(out.ax, out.ay, 0)
+                                last_sent = (out.ax, out.ay, 0)
 
                             log_tick(now, mission.state, marker_seen, robot, goal_for_log, last_out, last_sent, last_pose_cmd, "")
+
+                        elif mission.state == MissionState.TARGET_TURN_FOR_PLACE:
+                            commander.send_axes(0, 0, 0)
+
+                            if not target_turn_sent:
+                                ok = gr.publish_turn("180")  # your ESP defaults to TURN_180 if payload is anything
+                                target_turn_sent = True
+                                last_note = "mqtt_turn_180" if ok else "mqtt_turn_180_failed"
+
+                            if (now - mission.state_enter_time) >= GRIPPER_ACTION_SETTLE_S:
+                                set_state(MissionState.TARGET_LOWER)
+                                status_msg = "Turned. Lowering body (POSE)..."
+                                commander.set_motion_mode("pose")
+                            log_tick(now, mission.state, marker_seen, robot, cur_place, None, (0, 0, 0), 0, last_note)
 
                         elif mission.state == MissionState.TARGET_LOWER:
                             commander.send_axes(0, 0, 0)
@@ -788,9 +933,22 @@ def main() -> int:
                             last_pose_cmd = cmd
                             last_note = "pose_lower"
                             if (now - t0) >= LOWER_RAMP_S:
+                                set_state(MissionState.TARGET_OPEN_GRIP)
+                                status_msg = "Low reached. Opening gripper..."
+                            log_tick(now, mission.state, marker_seen, robot, cur_place, None, (0, 0, 0), last_pose_cmd, last_note)
+
+                        elif mission.state == MissionState.TARGET_OPEN_GRIP:
+                            commander.send_axes(0, 0, 0)
+
+                            if not target_open_sent:
+                                ok = gr.publish_grip("OPEN")
+                                target_open_sent = True
+                                last_note = "mqtt_grip_open" if ok else "mqtt_grip_open_failed"
+
+                            if (now - mission.state_enter_time) >= GRIPPER_ACTION_SETTLE_S:
                                 set_state(MissionState.TARGET_HOLD_LOW)
-                                status_msg = "Holding low for 5 seconds..."
-                            log_tick(now, mission.state, marker_seen, robot, cur_t, None, (0, 0, 0), last_pose_cmd, last_note)
+                                status_msg = "Gripper opened. Holding low for 5 seconds..."
+                            log_tick(now, mission.state, marker_seen, robot, cur_place, None, (0, 0, 0), 0, last_note)
 
                         elif mission.state == MissionState.TARGET_HOLD_LOW:
                             commander.send_axes(0, 0, 0)
@@ -806,7 +964,7 @@ def main() -> int:
                             if (now - t0) >= LOW_HOLD_S:
                                 set_state(MissionState.TARGET_RAISE)
                                 status_msg = "Raising back to normal height..."
-                            log_tick(now, mission.state, marker_seen, robot, cur_t, None, (0, 0, 0), last_pose_cmd, last_note)
+                            log_tick(now, mission.state, marker_seen, robot, cur_place, None, (0, 0, 0), last_pose_cmd, last_note)
 
                         elif mission.state == MissionState.TARGET_RAISE:
                             commander.send_axes(0, 0, 0)
@@ -821,11 +979,24 @@ def main() -> int:
                             last_note = "pose_raise"
                             if (now - t0) >= LOWER_RAMP_S:
                                 commander.set_motion_mode("move")
+                                set_state(MissionState.TARGET_TURN_BACK)
+                                status_msg = "Back to MOVE. Turning gripper back..."
+                            log_tick(now, mission.state, marker_seen, robot, cur_place, None, (0, 0, 0), last_pose_cmd, last_note)
+
+                        elif mission.state == MissionState.TARGET_TURN_BACK:
+                            commander.send_axes(0, 0, 0)
+
+                            if not target_turnback_sent:
+                                ok = gr.publish_turn("0")
+                                target_turnback_sent = True
+                                last_note = "mqtt_turn_0" if ok else "mqtt_turn_0_failed"
+
+                            if (now - mission.state_enter_time) >= GRIPPER_ACTION_SETTLE_S:
                                 set_state(MissionState.BACK_TO_TARGET_APPROACH)
                                 ctrl.reset()
                                 ctrl.set_lateral_sign(DEFAULT_LAT_SIGN)
-                                status_msg = "Back to MOVE. Backing out beyond approach..."
-                            log_tick(now, mission.state, marker_seen, robot, cur_t, None, (0, 0, 0), last_pose_cmd, last_note)
+                                status_msg = "Turned back. Backing out beyond approach..."
+                            log_tick(now, mission.state, marker_seen, robot, cur_place, None, (0, 0, 0), 0, last_note)
 
                         elif mission.state == MissionState.BACK_TO_TARGET_APPROACH:
                             goal_for_log = cur_back
@@ -842,8 +1013,8 @@ def main() -> int:
                                 status_msg = "Backed out. Going to HOME-APPROACH..."
                                 last_sent = (0, 0, 0)
                             else:
-                                commander.send_axes(out.ax, out.ay, out.az)
-                                last_sent = (out.ax, out.ay, out.az)
+                                commander.send_axes(out.ax, out.ay, 0)
+                                last_sent = (out.ax, out.ay, 0)
                             log_tick(now, mission.state, marker_seen, robot, goal_for_log, last_out, last_sent, last_pose_cmd, "")
 
                         elif mission.state == MissionState.GO_HOME_APPROACH:
@@ -866,8 +1037,8 @@ def main() -> int:
                                 else:
                                     status_msg = f"At HOME-APPROACH. Next: {nxt}"
                             else:
-                                commander.send_axes(out.ax, out.ay, out.az)
-                                last_sent = (out.ax, out.ay, out.az)
+                                commander.send_axes(out.ax, out.ay, 0)
+                                last_sent = (out.ax, out.ay, 0)
                             log_tick(now, mission.state, marker_seen, robot, goal_for_log, last_out, last_sent, last_pose_cmd, "")
 
                         elif mission.state == MissionState.GO_HOME_FINAL:
@@ -878,16 +1049,34 @@ def main() -> int:
                                 commander.stop_robot()
                                 ctrl.reset()
                                 ctrl.set_lateral_sign(DEFAULT_LAT_SIGN)
-                                set_state(MissionState.WAIT_HOME)
-                                status_msg = "At HOME. Simulating pick-up..."
+
+                                home_grip_sent = False
+                                set_state(MissionState.WAIT_HOME_BEFORE_GRIP)
+                                status_msg = "At HOME. Waiting 5s, then closing gripper..."
                                 last_sent = (0, 0, 0)
                             else:
-                                commander.send_axes(out.ax, out.ay, out.az)
-                                last_sent = (out.ax, out.ay, out.az)
+                                commander.send_axes(out.ax, out.ay, 0)
+                                last_sent = (out.ax, out.ay, 0)
                             log_tick(now, mission.state, marker_seen, robot, goal_for_log, last_out, last_sent, last_pose_cmd, "")
+
+                        elif mission.state == MissionState.WAIT_HOME_BEFORE_GRIP:
+                            commander.stop_robot()
+
+                            if (now - mission.state_enter_time) >= HOME_WAIT_BEFORE_GRIP_S:
+                                if not home_grip_sent:
+                                    ok = gr.publish_grip("CLOSE")
+                                    home_grip_sent = True
+                                    last_note = "mqtt_grip_close" if ok else "mqtt_grip_close_failed"
+                                    status_msg = "Gripper CLOSE sent. Continuing mission..."
+                                    # small settle window
+                                    set_state(MissionState.WAIT_HOME)
+                                else:
+                                    set_state(MissionState.WAIT_HOME)
+                            log_tick(now, mission.state, marker_seen, robot, mission.home_xy, None, (0, 0, 0), 0, last_note)
 
                         elif mission.state == MissionState.WAIT_HOME:
                             commander.stop_robot()
+                            # keep your original small pause too (so you don’t change pacing)
                             if (now - mission.state_enter_time) >= PAUSE_AT_HOME_S:
                                 mission.target_index += 1
                                 if mission.current_target() is None:
@@ -915,11 +1104,13 @@ def main() -> int:
 
             hud = [
                 status_msg,
+                gr.status_line(),
                 f"UDP: RUNNING robot={robot_ip}:{robot_port} (MOTION={'POSE' if mission.state in (MissionState.TARGET_LOWER, MissionState.TARGET_HOLD_LOW, MissionState.TARGET_RAISE) else 'MOVE'})  LOG={log_name}",
                 f"Mission: {mission.state}  target={mission.target_index+1 if mission.current_target() else '-'} / {len(mission.targets_xy) if mission.targets_xy else '-'}",
                 f"Calib: Plane={'LOCKED' if ksys.plane_locked else 'CAL'}  Origin(C1)={'SET' if ksys.grid_frame else 'NO'}  TapeAxis(C2)={'SET' if ksys.tape_frame else 'NO'}  Home={'SET' if mission.home_xy else 'NO'}",
                 f"RobotIDs: primary={ROBOT_ARUCO_ID} alt={ROBOT_ALT_IDS}  seen={marker_seen} pose={'OK' if robot else '---'} det_id={tracker.last_detected_id} strict={ARUCO_STRICTNESS:.2f}",
-                f"Axis knobs: fwd_fast={gains.axis_fwd_fast} fwd_near={gains.axis_fwd_near} lat={gains.axis_lat_mag} yawT={gains.axis_yaw_mag_target} lat_sign={ctrl.get_lateral_sign():+d}",
+                f"Axis knobs: fwd_fast={gains.axis_fwd_fast} fwd_near={gains.axis_fwd_near} lat={gains.axis_lat_mag} (NO YAW enforced) lat_sign={ctrl.get_lateral_sign():+d}",
+                f"Place offset: GRIPPER_OFFSET_X_M={GRIPPER_OFFSET_X_M:.3f}m  HomeGripWait={HOME_WAIT_BEFORE_GRIP_S:.1f}s",
                 f"Pose knobs: lower_axis={pose_lower} ramp_s={LOWER_RAMP_S:.1f} hold_s={LOW_HOLD_S:.1f} back_extra={BACK_EXTRA_M:.2f}m",
                 out_line,
                 f"Plane: {'LOCKED' if ksys.plane_locked else 'CALIBRATING'} Fits: {ksys.fit_count}/{FITS_TO_LOCK}",
