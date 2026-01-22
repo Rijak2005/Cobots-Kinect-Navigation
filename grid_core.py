@@ -228,9 +228,9 @@ def find_depth_pixel_for_color_xy(
         vmax = min(depth_h - 1, center_v + radius)
 
         best: Optional[Tuple[int, int, float]] = None
-        for v in range(vmin, vmax + 1, step):
-            for u in range(umin, umax + 1, step):
-                uv = map_depth_pixel_to_color_xy(kinect, depth_frame_1d, depth_w, u, v)
+        for vv in range(vmin, vmax + 1, step):
+            for uu in range(umin, umax + 1, step):
+                uv = map_depth_pixel_to_color_xy(kinect, depth_frame_1d, depth_w, uu, vv)
                 if uv is None:
                     continue
                 x, y = uv
@@ -238,7 +238,7 @@ def find_depth_pixel_for_color_xy(
                 dy = y - ty
                 d2 = dx * dx + dy * dy
                 if best is None or d2 < best[2]:
-                    best = (u, v, d2)
+                    best = (uu, vv, d2)
         return best
 
     b1 = search(seed_u, seed_v, radius=search_radius, step=10)
@@ -366,7 +366,9 @@ class KinectGridSystem:
     """
     Owns the Kinect runtime and maintains:
       - floor plane (calibrate + lock)
-      - grid frame origin (set by mouse click on taped center)
+      - grid_frame (CONTROL frame): set by click on taped center, axes from build_plane_basis (UNCHANGED semantics)
+      - tape_frame (TAPE frame): optional second click to define +X direction for the *tape grid*
+        This is used ONLY for generating tape-aligned grid points, then converted to CONTROL frame.
     """
     def __init__(
         self,
@@ -390,10 +392,15 @@ class KinectGridSystem:
         self.last_color_1d: Optional[np.ndarray] = None
         self.last_depth_1d: Optional[np.ndarray] = None
 
+        # CONTROL frame (your existing one)
         self.grid_frame: Optional[GridFrame] = None
+
+        # NEW: TAPE frame (only for tape-aligned grid point generation)
+        self.tape_frame: Optional[GridFrame] = None
 
         # Seeds for mapping (speed)
         self._seed_center_depth_uv: Optional[Tuple[int, int]] = None
+        self._seed_axis_depth_uv: Optional[Tuple[int, int]] = None
 
     def close(self) -> None:
         try:
@@ -418,6 +425,20 @@ class KinectGridSystem:
         self.plane_locked = False
         self.fit_count = 0
         self.smoother.reset()
+
+        # NEW (safe): also clear tape axis calibration (does not affect old code paths)
+        self.tape_frame = None
+        self._seed_axis_depth_uv = None
+
+    def clear_grid_calibration(self) -> None:
+        """
+        NEW helper: keeps plane, clears both frames so the user can re-click.
+        Old code doesn't call this, so it won't affect existing behavior.
+        """
+        self.grid_frame = None
+        self.tape_frame = None
+        self._seed_center_depth_uv = None
+        self._seed_axis_depth_uv = None
 
     def try_update_plane(
         self,
@@ -457,20 +478,18 @@ class KinectGridSystem:
         if self.fit_count >= fits_to_lock:
             self.plane_locked = True
 
-        # If a grid frame already exists, keep it (plane changes should be stopped after lock anyway).
-        # If you recalibrate, you should re-click the grid center.
-
-    def set_grid_center_from_color_click(
+    def _color_click_to_floor_cam(
         self,
         color_xy: Tuple[float, float],
-        search_radius: int = 160,
-    ) -> bool:
+        seed: Optional[Tuple[int, int]],
+        search_radius: int,
+    ) -> Tuple[Optional[np.ndarray], Optional[Tuple[int, int]]]:
         """
-        Convert a clicked COLOR pixel (where you taped the grid center on the floor)
-        into a 3D floor point and set the grid origin there.
+        Shared helper for click->depth->camera->project-to-plane.
+        Returns (p_floor_cam, depth_uv_seed_used).
         """
         if self.plane is None or self.last_depth_1d is None:
-            return False
+            return None, None
 
         depth_uv = find_depth_pixel_for_color_xy(
             self.kinect,
@@ -478,26 +497,100 @@ class KinectGridSystem:
             self.depth_w,
             self.depth_h,
             target_color_xy=color_xy,
-            seed_depth_uv=self._seed_center_depth_uv,
+            seed_depth_uv=seed,
             search_radius=search_radius,
         )
         if depth_uv is None:
-            return False
-        self._seed_center_depth_uv = depth_uv
+            return None, None
 
         u, v = depth_uv
         depth_mm = int(self.last_depth_1d[v * self.depth_w + u])
         p_cam = depth_pixel_to_camera_point(self.kinect, u, v, depth_mm)
         if p_cam is None:
+            return None, None
+
+        p_floor = project_point_to_plane(p_cam, self.plane)
+        return p_floor, depth_uv
+
+    def set_grid_center_from_color_click(
+        self,
+        color_xy: Tuple[float, float],
+        search_radius: int = 160,
+    ) -> bool:
+        """
+        CLICK #1:
+        Convert clicked COLOR pixel (taped grid center) into a 3D floor point
+        and set the CONTROL grid origin there.
+
+        IMPORTANT: This keeps your existing CONTROL axes from build_plane_basis (UNCHANGED).
+        """
+        p_floor, depth_uv = self._color_click_to_floor_cam(color_xy, self._seed_center_depth_uv, search_radius)
+        if p_floor is None or depth_uv is None:
             return False
 
-        # clicked tape is on floor; project to plane for robustness
-        p_floor = project_point_to_plane(p_cam, self.plane)
+        self._seed_center_depth_uv = depth_uv
 
-        # Deterministic basis here:
+        # clicked tape is on floor; already projected to plane for robustness
         e1, e2 = build_plane_basis(self.plane.n)
         self.grid_frame = GridFrame(plane=self.plane, origin_cam=p_floor, e1=e1, e2=e2)
+
+        # NEW: origin changed => tape axis must be re-clicked
+        self.tape_frame = None
+        self._seed_axis_depth_uv = None
         return True
+
+    def set_tape_axis_from_color_click(
+        self,
+        color_xy: Tuple[float, float],
+        search_radius: int = 160,
+        min_axis_len_m: float = 0.20,
+    ) -> bool:
+        """
+        CLICK #2:
+        Define the TAPE +X direction using a second clicked point on the floor.
+
+        This DOES NOT change grid_frame. It only creates tape_frame for generating
+        tape-aligned grid/targets (then you convert to control coords).
+        """
+        if self.grid_frame is None or self.plane is None:
+            return False
+
+        p2_floor, depth_uv = self._color_click_to_floor_cam(color_xy, self._seed_axis_depth_uv, search_radius)
+        if p2_floor is None or depth_uv is None:
+            return False
+        self._seed_axis_depth_uv = depth_uv
+
+        origin = self.grid_frame.origin_cam
+
+        # Use same deterministic normal sign convention as build_plane_basis
+        n = normalize(self.plane.n.astype(np.float64))
+        if n[2] > 0.0:
+            n = -n
+
+        v = (p2_floor - origin).astype(np.float64)
+        v = v - float(np.dot(v, n)) * n  # project onto plane
+
+        L = float(np.linalg.norm(v))
+        if L < float(min_axis_len_m):
+            return False
+
+        e1_tape = normalize(v)
+        e2_tape = normalize(np.cross(n, e1_tape))
+        if float(np.linalg.norm(e2_tape)) < 1e-6:
+            return False
+
+        self.tape_frame = GridFrame(plane=self.plane, origin_cam=origin, e1=e1_tape, e2=e2_tape)
+        return True
+
+    def tape_xy_to_control_xy(self, x_tape: float, y_tape: float) -> Optional[Tuple[float, float]]:
+        """
+        Convert a point expressed in the TAPE frame into CONTROL frame (x,y).
+        Camera-space is the bridge.
+        """
+        if self.grid_frame is None or self.tape_frame is None:
+            return None
+        p_cam = grid_xy_to_camera(float(x_tape), float(y_tape), self.tape_frame)
+        return camera_to_grid_xy(p_cam, self.grid_frame)
 
     def get_color_bgr(self) -> Optional[np.ndarray]:
         """

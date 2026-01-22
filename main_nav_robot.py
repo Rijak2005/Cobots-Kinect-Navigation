@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import time
 import csv
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Optional, Tuple, List
 
@@ -30,18 +30,18 @@ GRID_SPACING_M = 0.60
 
 # Target approach is BEFORE target in +X direction (tx - A)
 # Home approach is AFTER home in +X direction (hx + A)
-APPROACH_BEFORE_X_M = 0.30
-HOME_APPROACH_X = 1.10
+# IMPORTANT: these offsets remain in CONTROL frame (unchanged semantics)
+APPROACH_BEFORE_X_M = 0.25
+HOME_APPROACH_X = 1.30
 
-# Back out a bit more than the approach point
+# back out a bit more than the approach point (approach + extra)
 BACK_EXTRA_M = 0.20
 
 # Pose / body height knobs (deadzone for body height is |v| > 20000)
-# Must be <= -20001 (or >= +20001) to do anything. Negative lowers.
-TARGET_LOWER_AXIS = -24500  # <-- KNOB (start conservative)
+TARGET_LOWER_AXIS = -32000  # knob
 LOWER_RAMP_S = 2.0
 LOW_HOLD_S = 5.0
-POSE_SEND_HZ = 30.0  # send body-height commands at this rate during pose states
+POSE_SEND_HZ = 30.0
 
 FIT_EVERY_N_FRAMES = 10
 FITS_TO_LOCK = 25
@@ -65,6 +65,10 @@ HOME_COLOR = (255, 255, 0)
 ROBOT_COLOR = (0, 255, 255)
 HUD_COLOR = (255, 0, 0)
 CLICK_COLOR = (255, 0, 255)
+
+# Click marker colors
+CLICK1_COLOR = (255, 0, 255)  # origin
+CLICK2_COLOR = (0, 255, 255)  # tape +X
 
 AXIS_COLOR_X = (0, 255, 255)
 AXIS_COLOR_Y = (255, 255, 0)
@@ -94,12 +98,10 @@ class MissionState(str, Enum):
 @dataclass
 class Mission:
     home_xy: Optional[Tuple[float, float]] = None
-    targets_xy: List[Tuple[float, float]] = field(default_factory=list)
+    targets_xy: List[Tuple[float, float]] = None
     target_index: int = 0
     state: MissionState = MissionState.NEED_HOME
-
-    # Safe default (prevents accidental HOME bounce)
-    next_after_home_approach: MissionState = MissionState.GO_TARGET_APPROACH
+    next_after_home_approach: MissionState = MissionState.GO_HOME_FINAL
 
     state_enter_time: float = 0.0
     paused_resume_state: MissionState = MissionState.NEED_HOME
@@ -142,32 +144,37 @@ def draw_hud(img: np.ndarray, lines: list[str]) -> None:
         y += 26
 
 
-def draw_marker_cross(img: np.ndarray, x: float, y: float, color=CLICK_COLOR) -> None:
+def draw_marker_cross(img: np.ndarray, x: float, y: float, color=CLICK_COLOR, label: str = "") -> None:
     xi, yi = int(round(x)), int(round(y))
     h, w = img.shape[:2]
     if 0 <= xi < w and 0 <= yi < h:
         cv2.drawMarker(img, (xi, yi), color, markerType=cv2.MARKER_CROSS, markerSize=30, thickness=2)
-
-
-def _put_text_outlined(
-    img: np.ndarray,
-    text: str,
-    org: Tuple[int, int],
-    font_scale: float = 0.9,
-    thickness: int = 2,
-    color=(255, 255, 255),
-) -> None:
-    cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness + 3, cv2.LINE_AA)
-    cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, thickness, cv2.LINE_AA)
+        if label:
+            cv2.putText(img, label, (xi + 12, yi - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2, cv2.LINE_AA)
 
 
 def draw_grid_points(img: np.ndarray, ksys: KinectGridSystem, spacing_m: float) -> None:
-    frame = ksys.grid_frame
-    if frame is None:
+    """
+    Draw tape-aligned grid points if tape_frame is present.
+    Otherwise fall back to control-aligned (your old behavior).
+    """
+    cf = ksys.grid_frame
+    if cf is None:
         return
+
+    use_tape = (ksys.tape_frame is not None)
+
     for yy in (-spacing_m, 0.0, spacing_m):
         for xx in (-spacing_m, 0.0, spacing_m):
-            p_cam = grid_xy_to_camera(xx, yy, frame)
+            if use_tape:
+                xy_ctrl = ksys.tape_xy_to_control_xy(xx, yy)
+                if xy_ctrl is None:
+                    continue
+                gx, gy = xy_ctrl
+            else:
+                gx, gy = xx, yy
+
+            p_cam = grid_xy_to_camera(gx, gy, cf)
             uv = map_camera_point_to_color_xy(ksys.kinect, p_cam)
             if uv is None:
                 continue
@@ -176,11 +183,10 @@ def draw_grid_points(img: np.ndarray, ksys: KinectGridSystem, spacing_m: float) 
                 cv2.circle(img, (u, v), 6, POINT_COLOR, -1, cv2.LINE_AA)
 
 
-def draw_target_order_numbers(img: np.ndarray, ksys: KinectGridSystem, targets: List[Tuple[float, float]]) -> None:
+def draw_all_target_numbers(img: np.ndarray, ksys: KinectGridSystem, targets: List[Tuple[float, float]]) -> None:
     frame = ksys.grid_frame
-    if frame is None or not targets:
+    if frame is None:
         return
-
     for i, (tx, ty) in enumerate(targets):
         p_cam = grid_xy_to_camera(tx, ty, frame)
         uv = map_camera_point_to_color_xy(ksys.kinect, p_cam)
@@ -188,7 +194,10 @@ def draw_target_order_numbers(img: np.ndarray, ksys: KinectGridSystem, targets: 
             continue
         u, v = int(uv[0]), int(uv[1])
         if 0 <= u < img.shape[1] and 0 <= v < img.shape[0]:
-            _put_text_outlined(img, str(i + 1), (u + 12, v - 12), font_scale=0.95, thickness=2)
+            cv2.putText(img, str(i + 1), (u + 10, v - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 3, cv2.LINE_AA)
+            cv2.putText(img, str(i + 1), (u + 10, v - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 1, cv2.LINE_AA)
 
 
 def draw_goal_point(img, ksys, goal_xy, label, color, radius=10) -> Optional[Tuple[int, int]]:
@@ -271,30 +280,58 @@ def draw_axes_on_floor(img: np.ndarray, ksys: KinectGridSystem, axis_len_m: floa
 
 
 def build_target_order_lines(targets: List[Tuple[float, float]]) -> List[str]:
-    return [f"{i+1}: ({x:+.2f}, {y:+.2f})" for i, (x, y) in enumerate(targets)]
+    lines: List[str] = []
+    for i, (x, y) in enumerate(targets):
+        lines.append(f"{i+1}: ({x:+.2f}, {y:+.2f})")
+    return lines
 
 
-def make_targets_columnwise_right_to_left_top_to_bottom() -> List[Tuple[float, float]]:
+def make_targets_rowwise_top_to_bottom() -> List[Tuple[float, float]]:
     """
-    FIXED to the "other axis" you want:
-
-    Column-wise (not row-wise):
-      - Iterate columns RIGHT -> LEFT   (x = +s, 0, -s)
-      - Within each column: TOP -> BOTTOM (y = -s, 0, +s)
-
-    This yields numbering like:
-      right column: 1,2,3 (top->bottom)
-      middle column: 4,5,6
-      left column: 7,8,9
+    Returns IDEAL target coords in the (conceptual) tape grid:
+      - Row-wise, TOP -> BOTTOM
+      - Within each row: RIGHT -> LEFT
+    (These are still just +/- spacing values; we convert via tape_frame if present.)
     """
     s = GRID_SPACING_M
-    xs = [+s, 0.0, -s]      # right -> middle -> left
-    ys = [-s, 0.0, +s]      # top -> middle -> bottom
-    return [(x, y) for x in xs for y in ys]
+    ys = [+s, 0.0, -s]
+    xs = [-s, 0.0, +s]
+    return [(x, y) for y in ys for x in xs]
 
 
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
+
+def reorder_targets_by_x_then_y(ctrl_targets: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    """
+    Deterministic ordering:
+      - Split into 3 rows by X (highest X row first)
+      - Inside each row: Y in order (-s, 0, +s) => ascending Y
+    This is robust against tape-frame flips/rotation.
+    """
+    if not ctrl_targets:
+        return ctrl_targets
+
+    # If it's not exactly 9, fall back to simple sort
+    if len(ctrl_targets) != 9:
+        return sorted(ctrl_targets, key=lambda p: (-p[0], p[1]))
+
+    # 1) Sort by X descending
+    pts = sorted(ctrl_targets, key=lambda p: p[0], reverse=True)
+
+    # 2) Take top 3 as row1, next 3 row2, last 3 row3
+    rows = [pts[0:3], pts[3:6], pts[6:9]]
+
+    # 3) Sort each row by Y ascending: (-0.60, 0, +0.60)
+    for r in rows:
+        r.sort(key=lambda p: p[1])
+
+    # 4) Flatten
+    out: List[Tuple[float, float]] = []
+    for r in rows:
+        out.extend(r)
+    return out
+
 
 
 def _deadzone_safe_lower_value(v: int) -> int:
@@ -370,8 +407,12 @@ def main() -> int:
     ctrl = AxisStepController(gains)
     ctrl.set_lateral_sign(DEFAULT_LAT_SIGN)
 
-    clicked_color_xy: Optional[Tuple[float, float]] = None
-    status_msg = "1) Wait plane lock, 2) Left-click GRID CENTER tape."
+    # --- NEW: 2-click calibration state ---
+    click1_color_xy: Optional[Tuple[float, float]] = None  # origin
+    click2_color_xy: Optional[Tuple[float, float]] = None  # tape +X
+
+    status_msg = "Wait plane lock, then: LMB click #1 ORIGIN, then LMB click #2 on +X tape direction. Then place robot at HOME and press 'h'."
+
     targets_order_lines: List[str] = []
 
     mission = Mission(home_xy=None, targets_xy=[], target_index=0, state=MissionState.NEED_HOME, state_enter_time=time.monotonic())
@@ -380,20 +421,36 @@ def main() -> int:
     lost_since: Optional[float] = None
     frame_idx = 0
 
+    # ---- Pose sequence state ----
     pose_lower = _deadzone_safe_lower_value(TARGET_LOWER_AXIS)
     pose_last_send_t = 0.0
     pose_send_dt = 1.0 / max(5.0, float(POSE_SEND_HZ))
 
+    # -------- Logging setup (CSV) --------
     _ensure_dir("logs")
     log_name = time.strftime("logs/mission_log_%Y%m%d_%H%M%S.csv")
     log_f = open(log_name, "w", newline="", encoding="utf-8")
     log_w = csv.writer(log_f)
     log_w.writerow([
-        "t_mono", "state", "paused_manual", "paused_reason_lost", "marker_seen", "det_id",
-        "robot_x", "robot_y", "robot_heading_deg",
-        "goal_x", "goal_y", "ex", "ey", "dist",
-        "out_phase", "out_reached",
-        "sent_ax", "sent_ay", "sent_az",
+        "t_mono",
+        "state",
+        "paused_manual",
+        "paused_reason_lost",
+        "marker_seen",
+        "det_id",
+        "robot_x",
+        "robot_y",
+        "robot_heading_deg",
+        "goal_x",
+        "goal_y",
+        "ex",
+        "ey",
+        "dist",
+        "out_phase",
+        "out_reached",
+        "sent_ax",
+        "sent_ay",
+        "sent_az",
         "pose_body_height_cmd",
         "note",
     ])
@@ -402,6 +459,7 @@ def main() -> int:
     last_out: Optional[AxisOut] = None
     last_sent = (0, 0, 0)
     last_pose_cmd = 0
+    last_note = ""
 
     def set_state(s: MissionState) -> None:
         mission.state = s
@@ -464,28 +522,56 @@ def main() -> int:
         ])
         log_f.flush()
 
+    def reset_calib_and_mission() -> None:
+        nonlocal click1_color_xy, click2_color_xy, targets_order_lines, status_msg
+        click1_color_xy = None
+        click2_color_xy = None
+        ksys.grid_frame = None
+        ksys.tape_frame = None
+
+        mission.home_xy = None
+        mission.targets_xy = []
+        targets_order_lines = []
+        mission.target_index = 0
+        mission.have_completed_first_target = False
+        set_state(MissionState.NEED_HOME)
+        ctrl.reset()
+        ctrl.set_lateral_sign(DEFAULT_LAT_SIGN)
+        status_msg = "Cleared origin/axis/HOME. Wait plane lock, then click #1 ORIGIN and click #2 +X tape."
+
     def on_mouse(event, x, y, flags, userdata):
-        nonlocal clicked_color_xy, status_msg, targets_order_lines
+        nonlocal click1_color_xy, click2_color_xy, status_msg, targets_order_lines
         if event == cv2.EVENT_LBUTTONDOWN:
             cx = float(np.clip(x / DISPLAY_SCALE, 0, ksys.color_w - 1))
             cy = float(np.clip(y / DISPLAY_SCALE, 0, ksys.color_h - 1))
-            clicked_color_xy = (cx, cy)
-            status_msg = f"Clicked GRID CENTER at ({cx:.1f}, {cy:.1f}). Setting origin..."
+            cxy = (cx, cy)
+
+            if ksys.grid_frame is None:
+                click1_color_xy = cxy
+                ok = ksys.set_grid_center_from_color_click(cxy, search_radius=160)
+                if ok:
+                    status_msg = "Click #1 OK ✅ (origin set). Now click #2 on a point along the tape +X direction."
+                else:
+                    click1_color_xy = None
+                    status_msg = "Click #1 failed. Try clicking the taped center again (wait plane lock)."
+
+            elif ksys.tape_frame is None:
+                click2_color_xy = cxy
+                ok = ksys.set_tape_axis_from_color_click(cxy, search_radius=160, min_axis_len_m=0.20)
+                if ok:
+                    status_msg = "Click #2 OK ✅ (tape +X set). Now put robot at HOME and press 'h'."
+                else:
+                    click2_color_xy = None
+                    status_msg = "Click #2 failed (too close or mapping). Click a farther point along +X tape direction."
+
+            else:
+                # update tape axis if user clicks again
+                click2_color_xy = cxy
+                ok = ksys.set_tape_axis_from_color_click(cxy, search_radius=160, min_axis_len_m=0.20)
+                status_msg = "Tape axis updated ✅." if ok else "Tape axis update failed; try again."
+
         if event == cv2.EVENT_RBUTTONDOWN:
-            clicked_color_xy = None
-            ksys.grid_frame = None
-
-            mission.home_xy = None
-            mission.targets_xy = []
-            targets_order_lines = []
-            mission.target_index = 0
-            mission.have_completed_first_target = False
-            mission.next_after_home_approach = MissionState.GO_TARGET_APPROACH
-
-            set_state(MissionState.NEED_HOME)
-            ctrl.reset()
-            ctrl.set_lateral_sign(DEFAULT_LAT_SIGN)
-            status_msg = "Cleared origin + HOME. Left-click GRID CENTER again."
+            reset_calib_and_mission()
 
     cv2.setMouseCallback(WINDOW_NAME, on_mouse)
 
@@ -516,16 +602,17 @@ def main() -> int:
 
             bgr = bgra_to_bgr(bgra)
 
+            # Detect on pristine frame
             bgr_detect = np.ascontiguousarray(bgr.copy())
             robot: Optional[RobotPose2D] = tracker.detect_and_estimate(bgr_detect)
 
-            if clicked_color_xy is not None and ksys.grid_frame is None and ksys.plane is not None:
-                ok = ksys.set_grid_center_from_color_click(clicked_color_xy, search_radius=160)
-                status_msg = "Grid origin set ✅. Put robot at HOME and press 'h'." if ok else "Could not set origin yet. Click again or wait."
+            # Draw click markers
+            if click1_color_xy is not None:
+                draw_marker_cross(bgr, click1_color_xy[0], click1_color_xy[1], CLICK1_COLOR, "C1")
+            if click2_color_xy is not None:
+                draw_marker_cross(bgr, click2_color_xy[0], click2_color_xy[1], CLICK2_COLOR, "C2(+X)")
 
-            if clicked_color_xy is not None:
-                draw_marker_cross(bgr, clicked_color_xy[0], clicked_color_xy[1])
-
+            # Draw axes/grid
             draw_axes_on_floor(bgr, ksys, axis_len_m=0.60)
             draw_grid_points(bgr, ksys, GRID_SPACING_M)
 
@@ -534,6 +621,7 @@ def main() -> int:
             now = time.monotonic()
             marker_seen = bool(tracker.marker_seen_now or (robot is not None))
 
+            # LOST debounce + auto-resume
             if marker_seen:
                 lost_since = None
                 if mission.state == MissionState.PAUSED and paused_reason_lost:
@@ -557,22 +645,35 @@ def main() -> int:
             if robot is not None:
                 draw_robot(bgr, robot, ksys)
 
-            # Generate targets once HOME + grid origin exist
-            if ksys.grid_frame is not None and mission.home_xy is not None and not mission.targets_xy:
-                mission.targets_xy = make_targets_columnwise_right_to_left_top_to_bottom()
+            # Generate targets once CONTROL frame + TAPE axis + HOME exist
+            if (ksys.grid_frame is not None) and (ksys.tape_frame is not None) and (mission.home_xy is not None) and (not mission.targets_xy):
+                tape_targets = make_targets_rowwise_top_to_bottom()
+
+                ctrl_targets: List[Tuple[float, float]] = []
+                for xt, yt in tape_targets:
+                    xy_ctrl = ksys.tape_xy_to_control_xy(xt, yt)
+                    if xy_ctrl is None:
+                        continue
+                    ctrl_targets.append((float(xy_ctrl[0]), float(xy_ctrl[1])))
+
+                mission.targets_xy = reorder_targets_by_x_then_y(ctrl_targets)
                 mission.target_index = 0
                 targets_order_lines = build_target_order_lines(mission.targets_xy)
 
-                print("=== TARGET ORDER (grid coords) ===")
+                print("=== TARGET ORDER (CONTROL coords; from tape) ===")
                 for line in targets_order_lines:
                     print(line)
-                print("===================================")
+                print("===============================================")
 
                 mission.next_after_home_approach = MissionState.GO_TARGET_APPROACH
                 set_state(MissionState.GO_HOME_APPROACH)
-                status_msg = "Targets generated. Going to home APPROACH."
+                status_msg = "Targets generated (tape-aligned -> converted). Going to HOME-APPROACH."
                 ctrl.reset()
                 ctrl.set_lateral_sign(DEFAULT_LAT_SIGN)
+
+            # Draw all target numbers (overlay)
+            if mission.targets_xy:
+                draw_all_target_numbers(bgr, ksys, mission.targets_xy)
 
             cur_t = mission.current_target()
             cur_a = mission.current_approach()
@@ -581,7 +682,7 @@ def main() -> int:
 
             if mission.home_xy is not None:
                 draw_goal_point(bgr, ksys, mission.home_xy, "HOME", HOME_COLOR, radius=10)
-                if home_a is not None:
+                if mission.have_completed_first_target and home_a is not None:
                     draw_goal_point(bgr, ksys, home_a, "H-APP", APPROACH_COLOR, radius=8)
 
             if cur_t is not None:
@@ -589,14 +690,10 @@ def main() -> int:
                 draw_goal_point(bgr, ksys, cur_back, "BACK", (200, 50, 200), radius=7)
                 draw_goal_point(bgr, ksys, cur_t, f"T{mission.target_index+1}", TARGET_COLOR, radius=10)
 
-            # Draw order numbers on top. Preview if not generated yet.
-            if ksys.grid_frame is not None:
-                targets_for_numbers = mission.targets_xy if mission.targets_xy else make_targets_columnwise_right_to_left_top_to_bottom()
-                draw_target_order_numbers(bgr, ksys, targets_for_numbers)
-
             # ---------- Control loop ----------
             if now >= next_control:
                 next_control = now + dt
+                last_note = ""
                 last_pose_cmd = 0
                 last_out = None
                 last_sent = (0, 0, 0)
@@ -605,7 +702,8 @@ def main() -> int:
                     commander.stop_robot()
                     ctrl.reset()
                     ctrl.set_lateral_sign(DEFAULT_LAT_SIGN)
-                    log_tick(now, mission.state, marker_seen, robot, None, None, last_sent, last_pose_cmd, "paused_or_manual_stop")
+                    last_note = "paused_or_manual_stop"
+                    log_tick(now, mission.state, marker_seen, robot, None, None, last_sent, last_pose_cmd, last_note)
 
                 else:
                     safe_stop = (not commander.is_connected()) or (ksys.grid_frame is None) or (robot is None)
@@ -613,7 +711,8 @@ def main() -> int:
                         commander.stop_robot()
                         ctrl.reset()
                         ctrl.set_lateral_sign(DEFAULT_LAT_SIGN)
-                        log_tick(now, mission.state, marker_seen, robot, None, None, last_sent, last_pose_cmd, "safe_stop_no_pose_or_no_grid")
+                        last_note = "safe_stop_no_pose_or_no_grid"
+                        log_tick(now, mission.state, marker_seen, robot, None, None, last_sent, last_pose_cmd, last_note)
 
                     else:
                         goal_for_log: Optional[Tuple[float, float]] = None
@@ -622,7 +721,8 @@ def main() -> int:
                             commander.stop_robot()
                             ctrl.reset()
                             ctrl.set_lateral_sign(DEFAULT_LAT_SIGN)
-                            log_tick(now, mission.state, marker_seen, robot, None, None, last_sent, last_pose_cmd, "need_home")
+                            last_note = "need_home"
+                            log_tick(now, mission.state, marker_seen, robot, None, None, last_sent, last_pose_cmd, last_note)
 
                         elif mission.state == MissionState.GO_TARGET_APPROACH:
                             goal_for_log = cur_a
@@ -634,6 +734,7 @@ def main() -> int:
                                 ctrl.set_lateral_sign(DEFAULT_LAT_SIGN)
                                 set_state(MissionState.FACE_TARGET)
                                 status_msg = "At target APPROACH. Micro-yaw (if needed) to face target..."
+                                last_sent = (0, 0, 0)
                             else:
                                 commander.send_axes(out.ax, out.ay, out.az)
                                 last_sent = (out.ax, out.ay, out.az)
@@ -649,6 +750,7 @@ def main() -> int:
                                 ctrl.set_lateral_sign(DEFAULT_LAT_SIGN)
                                 set_state(MissionState.GO_TARGET_FINAL)
                                 status_msg = "Facing target (or yaw skipped). Forward slowly..."
+                                last_sent = (0, 0, 0)
                             else:
                                 commander.send_axes(out.ax, out.ay, out.az)
                                 last_sent = (out.ax, out.ay, out.az)
@@ -662,55 +764,68 @@ def main() -> int:
                                 commander.stop_robot()
                                 ctrl.reset()
                                 ctrl.set_lateral_sign(DEFAULT_LAT_SIGN)
+
                                 set_state(MissionState.TARGET_LOWER)
                                 status_msg = f"At target {mission.target_index+1}. Lowering body (POSE)..."
                                 commander.set_motion_mode("pose")
+                                last_sent = (0, 0, 0)
                             else:
                                 commander.send_axes(out.ax, out.ay, out.az)
                                 last_sent = (out.ax, out.ay, out.az)
+
                             log_tick(now, mission.state, marker_seen, robot, goal_for_log, last_out, last_sent, last_pose_cmd, "")
 
                         elif mission.state == MissionState.TARGET_LOWER:
                             commander.send_axes(0, 0, 0)
+
                             t0 = mission.state_enter_time
                             cmd = _ramp_value(now, t0, LOWER_RAMP_S, start=0, end=pose_lower)
+
                             if (now - pose_last_send_t) >= pose_send_dt:
                                 commander.send_body_height_axis_once(cmd)
                                 pose_last_send_t = now
+
                             last_pose_cmd = cmd
+                            last_note = "pose_lower"
                             if (now - t0) >= LOWER_RAMP_S:
                                 set_state(MissionState.TARGET_HOLD_LOW)
                                 status_msg = "Holding low for 5 seconds..."
-                            log_tick(now, mission.state, marker_seen, robot, cur_t, None, (0, 0, 0), last_pose_cmd, "pose_lower")
+                            log_tick(now, mission.state, marker_seen, robot, cur_t, None, (0, 0, 0), last_pose_cmd, last_note)
 
                         elif mission.state == MissionState.TARGET_HOLD_LOW:
                             commander.send_axes(0, 0, 0)
+
                             t0 = mission.state_enter_time
                             cmd = pose_lower
                             if (now - pose_last_send_t) >= pose_send_dt:
                                 commander.send_body_height_axis_once(cmd)
                                 pose_last_send_t = now
+
                             last_pose_cmd = cmd
+                            last_note = "pose_hold_low"
                             if (now - t0) >= LOW_HOLD_S:
                                 set_state(MissionState.TARGET_RAISE)
                                 status_msg = "Raising back to normal height..."
-                            log_tick(now, mission.state, marker_seen, robot, cur_t, None, (0, 0, 0), last_pose_cmd, "pose_hold_low")
+                            log_tick(now, mission.state, marker_seen, robot, cur_t, None, (0, 0, 0), last_pose_cmd, last_note)
 
                         elif mission.state == MissionState.TARGET_RAISE:
                             commander.send_axes(0, 0, 0)
+
                             t0 = mission.state_enter_time
                             cmd = _ramp_value(now, t0, LOWER_RAMP_S, start=pose_lower, end=0)
                             if (now - pose_last_send_t) >= pose_send_dt:
                                 commander.send_body_height_axis_once(cmd)
                                 pose_last_send_t = now
+
                             last_pose_cmd = cmd
+                            last_note = "pose_raise"
                             if (now - t0) >= LOWER_RAMP_S:
                                 commander.set_motion_mode("move")
                                 set_state(MissionState.BACK_TO_TARGET_APPROACH)
                                 ctrl.reset()
                                 ctrl.set_lateral_sign(DEFAULT_LAT_SIGN)
                                 status_msg = "Back to MOVE. Backing out beyond approach..."
-                            log_tick(now, mission.state, marker_seen, robot, cur_t, None, (0, 0, 0), last_pose_cmd, "pose_raise")
+                            log_tick(now, mission.state, marker_seen, robot, cur_t, None, (0, 0, 0), last_pose_cmd, last_note)
 
                         elif mission.state == MissionState.BACK_TO_TARGET_APPROACH:
                             goal_for_log = cur_back
@@ -720,10 +835,12 @@ def main() -> int:
                                 commander.stop_robot()
                                 ctrl.reset()
                                 ctrl.set_lateral_sign(DEFAULT_LAT_SIGN)
+
                                 mission.have_completed_first_target = True
                                 mission.next_after_home_approach = MissionState.GO_HOME_FINAL
                                 set_state(MissionState.GO_HOME_APPROACH)
                                 status_msg = "Backed out. Going to HOME-APPROACH..."
+                                last_sent = (0, 0, 0)
                             else:
                                 commander.send_axes(out.ax, out.ay, out.az)
                                 last_sent = (out.ax, out.ay, out.az)
@@ -738,12 +855,14 @@ def main() -> int:
                                 commander.stop_robot()
                                 ctrl.reset()
                                 ctrl.set_lateral_sign(DEFAULT_LAT_SIGN)
+
                                 nxt = mission.next_after_home_approach
                                 set_state(nxt)
+
                                 if nxt == MissionState.GO_TARGET_APPROACH:
                                     status_msg = "At HOME-APPROACH. Now going to target APPROACH..."
                                 elif nxt == MissionState.GO_HOME_FINAL:
-                                    status_msg = "At HOME-APPROACH. Translating to HOME (no yaw)..."
+                                    status_msg = "At HOME-APPROACH. Translating to HOME..."
                                 else:
                                     status_msg = f"At HOME-APPROACH. Next: {nxt}"
                             else:
@@ -761,6 +880,7 @@ def main() -> int:
                                 ctrl.set_lateral_sign(DEFAULT_LAT_SIGN)
                                 set_state(MissionState.WAIT_HOME)
                                 status_msg = "At HOME. Simulating pick-up..."
+                                last_sent = (0, 0, 0)
                             else:
                                 commander.send_axes(out.ax, out.ay, out.az)
                                 last_sent = (out.ax, out.ay, out.az)
@@ -787,6 +907,7 @@ def main() -> int:
                             ctrl.set_lateral_sign(DEFAULT_LAT_SIGN)
                             log_tick(now, mission.state, marker_seen, robot, None, None, (0, 0, 0), 0, "done")
 
+            # ---------- HUD ----------
             if last_out is None:
                 out_line = "CtrlOut: (none)"
             else:
@@ -796,16 +917,17 @@ def main() -> int:
                 status_msg,
                 f"UDP: RUNNING robot={robot_ip}:{robot_port} (MOTION={'POSE' if mission.state in (MissionState.TARGET_LOWER, MissionState.TARGET_HOLD_LOW, MissionState.TARGET_RAISE) else 'MOVE'})  LOG={log_name}",
                 f"Mission: {mission.state}  target={mission.target_index+1 if mission.current_target() else '-'} / {len(mission.targets_xy) if mission.targets_xy else '-'}",
-                f"Home: {'SET' if mission.home_xy else 'NOT SET'}  GridOrigin: {'SET' if ksys.grid_frame else 'NOT SET'}",
+                f"Calib: Plane={'LOCKED' if ksys.plane_locked else 'CAL'}  Origin(C1)={'SET' if ksys.grid_frame else 'NO'}  TapeAxis(C2)={'SET' if ksys.tape_frame else 'NO'}  Home={'SET' if mission.home_xy else 'NO'}",
                 f"RobotIDs: primary={ROBOT_ARUCO_ID} alt={ROBOT_ALT_IDS}  seen={marker_seen} pose={'OK' if robot else '---'} det_id={tracker.last_detected_id} strict={ARUCO_STRICTNESS:.2f}",
                 f"Axis knobs: fwd_fast={gains.axis_fwd_fast} fwd_near={gains.axis_fwd_near} lat={gains.axis_lat_mag} yawT={gains.axis_yaw_mag_target} lat_sign={ctrl.get_lateral_sign():+d}",
                 f"Pose knobs: lower_axis={pose_lower} ramp_s={LOWER_RAMP_S:.1f} hold_s={LOW_HOLD_S:.1f} back_extra={BACK_EXTRA_M:.2f}m",
                 out_line,
                 f"Plane: {'LOCKED' if ksys.plane_locked else 'CALIBRATING'} Fits: {ksys.fit_count}/{FITS_TO_LOCK}",
-                "Keys: q/ESC quit, p pause/resume, SPACE stop, r recalibrate, h set HOME at robot position",
+                "Mouse: LMB click1 origin, LMB click2 tape +X (3rd click updates axis), RMB reset origin/axis/home",
+                "Keys: q/ESC quit, p pause/resume, SPACE stop, r recalibrate plane, h set HOME at robot position",
             ]
             if targets_order_lines:
-                hud.append("Target order (grid):")
+                hud.append("Target order (control coords, from tape):")
                 hud.extend(targets_order_lines)
 
             draw_hud(bgr, hud)
@@ -850,21 +972,21 @@ def main() -> int:
 
                 ksys.recalibrate_plane()
                 ksys.grid_frame = None
-                clicked_color_xy = None
+                ksys.tape_frame = None
+                click1_color_xy = None
+                click2_color_xy = None
 
                 mission.home_xy = None
                 mission.targets_xy = []
                 targets_order_lines = []
                 mission.target_index = 0
                 mission.have_completed_first_target = False
-                mission.next_after_home_approach = MissionState.GO_TARGET_APPROACH
-
                 set_state(MissionState.NEED_HOME)
-                status_msg = "Recalibrating. Left-click GRID CENTER again."
+                status_msg = "Recalibrating plane. Wait LOCK → click #1 ORIGIN → click #2 +X tape."
                 ctrl.set_lateral_sign(DEFAULT_LAT_SIGN)
 
             if key == ord("h"):
-                if robot is not None:
+                if (robot is not None) and (ksys.grid_frame is not None) and (ksys.tape_frame is not None):
                     mission.home_xy = (float(robot.x), float(robot.y))
                     status_msg = f"HOME set: x={mission.home_xy[0]:+.2f}, y={mission.home_xy[1]:+.2f}"
                     paused_manual = False
@@ -873,7 +995,12 @@ def main() -> int:
                     ctrl.reset()
                     ctrl.set_lateral_sign(DEFAULT_LAT_SIGN)
                 else:
-                    status_msg = "Cannot set HOME: robot pose not available."
+                    if ksys.grid_frame is None:
+                        status_msg = "Cannot set HOME: click #1 ORIGIN first."
+                    elif ksys.tape_frame is None:
+                        status_msg = "Cannot set HOME: click #2 (+X tape) first."
+                    else:
+                        status_msg = "Cannot set HOME: robot pose not available."
 
             frame_idx += 1
             time.sleep(0.001)
